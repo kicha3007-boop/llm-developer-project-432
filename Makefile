@@ -1,7 +1,11 @@
-.PHONY: install infra infra-down infra-reset migrate api worker reindex search lint format test test-db check evals evals-all stuck cost
+.PHONY: setup install infra infra-down infra-reset migrate api worker reindex search lint format test test-db check evals evals-all stuck cost
 
 UV ?= uv
 RUN = $(UV) run --frozen
+
+# Подготовка с нуля: зависимости и, если задан DATABASE_URL, миграции (её вызывает автопроверка Хекслета)
+setup: install
+	@if [ -n "$$DATABASE_URL" ]; then $(RUN) python -m app.core.migrate; fi
 
 # Зависимости — из файла блокировки, одной командой
 install:
