@@ -1,11 +1,12 @@
 """Разбор docx: параграфы и таблицы в порядке документа.
 
-Заголовок (стили Heading N / Title) — граница секции: по нему потом видно, из какой части документа
-взят фрагмент. Страниц у docx нет, поэтому номер считается по явным разрывам страниц.
+Заголовок (стили Heading N / Title) — граница секции: по нему потом видно, из какой части
+документа взят фрагмент. Страниц у docx нет, номер считается по явным разрывам страниц.
 """
 
 from __future__ import annotations
 
+import io
 from pathlib import Path
 
 import docx
@@ -13,7 +14,7 @@ from docx.oxml.ns import qn
 from docx.table import Table
 from docx.text.paragraph import Paragraph
 
-from app.parsers import Block, ParsedDocument, ParseError
+from app.parsers import Block, ParseError, read_source
 
 
 def _heading_level(paragraph: Paragraph) -> int | None:
@@ -27,23 +28,18 @@ def _heading_level(paragraph: Paragraph) -> int | None:
 
 
 def _page_breaks(element) -> int:
-    breaks = 0
-    for br in element.iter(qn("w:br")):
-        if br.get(qn("w:type")) == "page":
-            breaks += 1
-    breaks += len(list(element.iter(qn("w:lastRenderedPageBreak"))))
-    return breaks
+    breaks = sum(1 for br in element.iter(qn("w:br")) if br.get(qn("w:type")) == "page")
+    return breaks + len(list(element.iter(qn("w:lastRenderedPageBreak"))))
 
 
-def parse_docx(path: str | Path) -> ParsedDocument:
+def parse_docx(source: bytes | str | Path) -> list[Block]:
     try:
-        document = docx.Document(str(path))
+        document = docx.Document(io.BytesIO(read_source(source)))
     except Exception as exc:
         raise ParseError(f"docx не открывается: {exc}") from exc
 
     blocks: list[Block] = []
     page = 1
-    title: str | None = None
     for element in document.element.body.iterchildren():
         tag = element.tag.split("}")[-1]
         if tag == "p":
@@ -54,11 +50,11 @@ def parse_docx(path: str | Path) -> ParsedDocument:
                 continue
             level = _heading_level(paragraph)
             if level is not None:
-                blocks.append(Block(kind="heading", text=text, page=page, level=level))
-                if title is None and level >= 2:
-                    title = text
+                blocks.append(
+                    Block(kind="heading", content=text, metadata={"page": page, "level": level})
+                )
             else:
-                blocks.append(Block(kind="text", text=text, page=page))
+                blocks.append(Block(kind="text", content=text, metadata={"page": page}))
         elif tag == "tbl":
             table = Table(element, document)
             rows = []
@@ -67,7 +63,12 @@ def parse_docx(path: str | Path) -> ParsedDocument:
                 if any(cells):
                     rows.append(cells)
             if rows:
-                blocks.append(Block(kind="table", text="", page=page, rows=rows))
-    if title is None:
-        title = next((b.text for b in blocks if b.kind == "heading"), None)
-    return ParsedDocument(blocks=blocks, pages=page, title=title, fmt="docx")
+                blocks.append(
+                    Block(
+                        kind="table",
+                        content="\n".join(" | ".join(r) for r in rows),
+                        rows=rows,
+                        metadata={"page": page},
+                    )
+                )
+    return blocks

@@ -3,6 +3,8 @@
 TestClient без контекстного менеджера не запускает жизненный цикл: пул базы здесь не нужен,
 репозитории подменены."""
 
+from contextlib import nullcontext
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -15,13 +17,13 @@ from tests.conftest import as_json
 
 @pytest.fixture
 def memory_jobs(monkeypatch):
-    """Таблица задач в памяти вместо базы."""
+    """Таблица задач в памяти вместо базы; соединение из пула не нужно."""
     rows: dict[str, dict] = {}
     keys: dict[str, str] = {}
 
-    def create_job(kind, payload, key=None):
+    def create_job(conn, payload, key=None, kind="card"):
         if key and key in keys:
-            return keys[key], False
+            return keys[key]
         job_id = f"job{len(rows) + 1}"
         rows[job_id] = {
             "id": job_id,
@@ -37,18 +39,23 @@ def memory_jobs(monkeypatch):
         }
         if key:
             keys[key] = job_id
-        return job_id, True
+        return job_id
 
-    def set_status(job_id, status, **kw):
+    def set_status(conn, job_id, status, **kw):
         rows[job_id]["status"] = status
         rows[job_id].update({k: v for k, v in kw.items() if k in rows[job_id] and v is not None})
 
+    for module in ("app.routers.jobs", "app.routers.generate"):
+        monkeypatch.setattr(f"{module}.connection", nullcontext)
     monkeypatch.setattr(jobs_repo, "create_job", create_job)
-    monkeypatch.setattr(jobs_repo, "get_job", lambda job_id: rows.get(job_id))
+    monkeypatch.setattr(jobs_repo, "get_job", lambda conn, job_id: rows.get(job_id))
+    monkeypatch.setattr(jobs_repo, "get_job_by_key", lambda conn, key: rows.get(keys.get(key, "")))
     monkeypatch.setattr(jobs_repo, "set_status", set_status)
-    monkeypatch.setattr(jobs_repo, "set_workflow_id", lambda job_id, wf: None)
+    monkeypatch.setattr(jobs_repo, "set_workflow_id", lambda conn, job_id, wf: None)
     monkeypatch.setattr(
-        documents_repo, "get_many", lambda ids: [{"id": i} for i in ids if i.startswith("doc")]
+        documents_repo,
+        "get_documents",
+        lambda conn, ids: [{"id": i} for i in ids if i.startswith("doc")],
     )
     return rows
 
@@ -115,7 +122,7 @@ def test_upload_rejects_unsupported_format():
 
 def test_sync_card_endpoint(fake_llm):
     fake_llm.role(
-        "extractor",
+        "Extractor",
         as_json(
             {
                 "product_name": "Чайник",
@@ -125,7 +132,7 @@ def test_sync_card_endpoint(fake_llm):
         ),
     )
     fake_llm.role(
-        "generator",
+        "Generator",
         as_json(
             {
                 "title": "Чайник 2200 Вт",
@@ -135,14 +142,14 @@ def test_sync_card_endpoint(fake_llm):
             }
         ),
     )
-    fake_llm.role("critic", as_json({"verdict": "approve", "issues": []}))
+    fake_llm.role("Critic", as_json({"verdict": "approve", "issues": []}))
     client = TestClient(app)
     response = client.post("/cards", json={"supplier_text": "Чайник 2200 Вт"})
     assert response.status_code == 200
     data = response.json()
     assert data["card"]["missing_fields"] == ["Цвет"]
     assert data["card"]["confidence"] < 1.0
-    assert data["status"] in {"approved", "needs_review"}
+    assert data["status"] in {"done", "needs_review"}
 
 
 def test_sync_card_invalid_model_answer_is_not_500(fake_llm):

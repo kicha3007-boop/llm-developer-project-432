@@ -1,6 +1,6 @@
-"""Общие фикстуры. Модель подменяется на границе провайдера — ``app.llm.client.run_agent``
-(или глубже, ``_call_model``, в тестах самого клиента). Тесты с пометкой ``db`` ходят в живую
-базу из DATABASE_URL и пропускаются, если она недоступна."""
+"""Общие фикстуры. Модель подменяется на границе провайдера: ``run_agent(agent, prompt)``
+в модулях, которые к ней обращаются (как в эталоне курса — подмена функции на уровне модуля).
+Тесты с пометкой ``db`` ходят в живую базу из DATABASE_URL и пропускаются без неё."""
 
 from __future__ import annotations
 
@@ -14,19 +14,18 @@ from typing import Any
 import psycopg
 import pytest
 
-from app.agents.prompts import AgentSpec
 from app.core import db
 from app.core.config import settings
-from app.llm import client as llm_client
 
 DATA = Path(__file__).resolve().parents[1] / "data"
 
-Reply = str | Exception | Callable[[AgentSpec, str], str]
+Reply = str | Exception | Callable[[Any, str], Any]
+LLM_MODULES = ("app.services.structured", "app.services.pipeline", "app.services.rag_pipeline")
 
 
 @dataclass
 class FakeLLM:
-    """Сценарий ответов модели: по очереди или по имени роли."""
+    """Сценарий ответов модели: по очереди или по имени агента (Extractor, Generator, Critic…)."""
 
     queue: list[Reply] = field(default_factory=list)
     by_role: dict[str, list[Reply]] = field(default_factory=dict)
@@ -40,34 +39,19 @@ class FakeLLM:
         self.by_role.setdefault(name, []).extend(replies)
         return self
 
-    async def __call__(
-        self,
-        spec: AgentSpec,
-        prompt: str,
-        *,
-        schema: dict[str, Any] | None = None,
-        purpose: str | None = None,
-    ) -> str:
-        self.calls.append(
-            {
-                "role": spec.name,
-                "prompt": prompt,
-                "purpose": purpose,
-                "cheap": spec.cheap,
-                "schema": schema,
-            }
-        )
-        source = self.by_role.get(spec.name)
+    async def __call__(self, agent: Any, prompt: str) -> Any:
+        self.calls.append({"role": agent.name, "prompt": prompt, "model": agent.model})
+        source = self.by_role.get(agent.name)
         if source:
             reply = source.pop(0) if len(source) > 1 else source[0]
         elif self.queue:
             reply = self.queue.pop(0)
         else:
-            raise AssertionError(f"нет ответа для роли {spec.name}")
+            raise AssertionError(f"нет ответа для агента {agent.name}")
         if isinstance(reply, Exception):
             raise reply
         if callable(reply):
-            return reply(spec, prompt)
+            return reply(agent, prompt)
         return reply
 
     def roles(self) -> list[str]:
@@ -77,7 +61,8 @@ class FakeLLM:
 @pytest.fixture
 def fake_llm(monkeypatch: pytest.MonkeyPatch) -> FakeLLM:
     fake = FakeLLM()
-    monkeypatch.setattr(llm_client, "run_agent", fake)
+    for module in LLM_MODULES:
+        monkeypatch.setattr(f"{module}.run_agent", fake)
     return fake
 
 
@@ -106,6 +91,12 @@ def live_db() -> Iterator[None]:
     db.open_pool(wait=True)
     yield
     db.close_pool()
+
+
+@pytest.fixture
+def conn(live_db) -> Iterator[psycopg.Connection]:
+    with db.connection() as connection:
+        yield connection
 
 
 @pytest.fixture

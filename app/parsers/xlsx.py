@@ -6,11 +6,12 @@
 
 from __future__ import annotations
 
+import io
 from pathlib import Path
 
 import openpyxl
 
-from app.parsers import Block, ParsedDocument, ParseError
+from app.parsers import Block, ParseError, read_source
 
 
 def _cell(value: object) -> str:
@@ -21,14 +22,15 @@ def _cell(value: object) -> str:
     return " ".join(str(value).split())
 
 
-def parse_xlsx(path: str | Path) -> ParsedDocument:
+def parse_xlsx(source: bytes | str | Path) -> list[Block]:
     try:
-        workbook = openpyxl.load_workbook(str(path), data_only=True, read_only=True)
+        workbook = openpyxl.load_workbook(
+            io.BytesIO(read_source(source)), data_only=True, read_only=True
+        )
     except Exception as exc:
         raise ParseError(f"xlsx не открывается: {exc}") from exc
 
     blocks: list[Block] = []
-    title: str | None = None
     try:
         for sheet_no, sheet in enumerate(workbook.worksheets, start=1):
             rows = [[_cell(v) for v in row] for row in sheet.iter_rows(values_only=True)]
@@ -37,17 +39,20 @@ def parse_xlsx(path: str | Path) -> ParsedDocument:
                 continue
             width = max(len(r) for r in rows)
             rows = [r + [""] * (width - len(r)) for r in rows]
-            # пустые колонки справа/между убираем по всей таблице
-            keep = [i for i in range(width) if any(r[i] for r in rows)]
+            keep = [i for i in range(width) if any(r[i] for r in rows)]  # пустые колонки — вон
             rows = [[r[i] for i in keep] for r in rows]
-            blocks.append(Block(kind="heading", text=sheet.title, page=sheet_no, level=1))
+            meta = {"page": sheet_no, "sheet": sheet.title}
+            blocks.append(Block(kind="heading", content=sheet.title, metadata={**meta, "level": 1}))
             blocks.append(
-                Block(kind="table", text="", page=sheet_no, rows=rows, meta={"sheet": sheet.title})
+                Block(
+                    kind="table",
+                    content="\n".join(" | ".join(r) for r in rows),
+                    rows=rows,
+                    metadata=meta,
+                )
             )
-            if title is None:
-                title = sheet.title
     finally:
         workbook.close()
     if not blocks:
         raise ParseError("в xlsx нет непустых листов")
-    return ParsedDocument(blocks=blocks, pages=None, title=title, fmt="xlsx")
+    return blocks

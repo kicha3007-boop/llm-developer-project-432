@@ -1,62 +1,76 @@
-"""Репозиторий документов поставщиков."""
+"""Репозиторий документов поставщиков. Соединение передаёт вызывающий."""
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any
 
-from app.core.db import connection
+import psycopg
+from psycopg.rows import dict_row
 
 _COLUMNS = (
-    "id, sha256, filename, extension, size_bytes, storage_path, status, error, title, pages, "
-    "created_at, updated_at"
+    "d.id, d.content_hash, d.filename, d.kind, d.size_bytes, d.stored_path, d.status, d.error, "
+    "d.title, d.pages, d.created_at, d.updated_at"
 )
 
 
-def get_or_create(
+def create_document(
+    conn: psycopg.Connection,
     *,
     document_id: str,
-    sha256: str,
     filename: str,
-    extension: str,
-    size_bytes: int,
-    storage_path: str,
+    content_hash: str,
+    kind: str,
+    size_bytes: int | None = None,
+    stored_path: str | None = None,
 ) -> tuple[dict[str, Any], bool]:
-    """Регистрирует документ; повторная загрузка того же содержимого возвращает существующий."""
-    with connection() as conn:
-        row = conn.execute(
-            f"""
-            INSERT INTO documents (id, sha256, filename, extension, size_bytes, storage_path)
+    """Регистрирует документ; то же содержимое повторно — существующая запись, без дубля."""
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            """
+            INSERT INTO documents (id, content_hash, filename, kind, size_bytes, stored_path)
             VALUES (%s, %s, %s, %s, %s, %s)
-            ON CONFLICT (sha256) DO NOTHING
-            RETURNING {_COLUMNS}
+            ON CONFLICT (content_hash) DO NOTHING
+            RETURNING id
             """,
-            (document_id, sha256, filename, extension, size_bytes, storage_path),
-        ).fetchone()
-        if row:
-            return row, True
-        existing = conn.execute(
-            f"SELECT {_COLUMNS} FROM documents WHERE sha256 = %s", (sha256,)
-        ).fetchone()
-    assert existing is not None
-    return existing, False
+            (document_id, content_hash, filename, kind.lstrip("."), size_bytes, stored_path),
+        )
+        created = cur.fetchone() is not None
+        cur.execute(
+            f"SELECT {_COLUMNS} FROM documents d WHERE d.content_hash = %s", (content_hash,)
+        )
+        row = cur.fetchone()
+    assert row is not None
+    return row, created
 
 
-def get(document_id: str) -> dict[str, Any] | None:
-    with connection() as conn:
-        return conn.execute(
-            f"SELECT {_COLUMNS} FROM documents WHERE id = %s", (document_id,)
-        ).fetchone()
+def get_document(conn: psycopg.Connection, document_id: str) -> dict[str, Any] | None:
+    """Документ со счётчиками фрагментов (всего и с вектором)."""
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            f"""
+            SELECT {_COLUMNS},
+                   (SELECT count(*) FROM chunks c WHERE c.doc_id = d.id) AS chunks_count,
+                   (SELECT count(*) FROM chunks c
+                     WHERE c.doc_id = d.id AND c.embedding IS NOT NULL) AS embedded_count
+            FROM documents d WHERE d.id = %s
+            """,
+            (document_id,),
+        )
+        return cur.fetchone()
 
 
-def get_many(document_ids: list[str]) -> list[dict[str, Any]]:
-    with connection() as conn:
-        return conn.execute(
-            f"SELECT {_COLUMNS} FROM documents WHERE id = ANY(%s) ORDER BY id",
-            (document_ids,),
-        ).fetchall()
+def get_documents(conn: psycopg.Connection, document_ids: Sequence[str]) -> list[dict[str, Any]]:
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            f"SELECT {_COLUMNS} FROM documents d WHERE d.id = ANY(%s) ORDER BY d.id",
+            (list(document_ids),),
+        )
+        return cur.fetchall()
 
 
 def set_status(
+    conn: psycopg.Connection,
     document_id: str,
     status: str,
     *,
@@ -73,5 +87,14 @@ def set_status(
         sets.append("pages = %s")
         args.append(pages)
     args.append(document_id)
-    with connection() as conn:
-        conn.execute(f"UPDATE documents SET {', '.join(sets)} WHERE id = %s", args)
+    with conn.cursor() as cur:
+        cur.execute(f"UPDATE documents SET {', '.join(sets)} WHERE id = %s", args)
+
+
+def mark_chunks_suspicious(conn: psycopg.Connection, chunk_ids: Sequence[str]) -> int:
+    """Вердикт защиты сохраняется во фрагменте: заблокированный фрагмент отличим от обычного."""
+    if not chunk_ids:
+        return 0
+    with conn.cursor() as cur:
+        cur.execute("UPDATE chunks SET suspicious = TRUE WHERE id = ANY(%s)", (list(chunk_ids),))
+        return cur.rowcount

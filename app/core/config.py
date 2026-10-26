@@ -42,7 +42,7 @@ class Settings(BaseSettings):
 
     # Эмбеддинги
     embedding_model: str = "intfloat/multilingual-e5-base"
-    embedding_dim: int = 768
+    embed_dim: int = 768
     embedding_query_prefix: str = "query: "
     embedding_document_prefix: str = "passage: "
     embedding_batch_size: int = 32
@@ -55,8 +55,7 @@ class Settings(BaseSettings):
 
     # Генерация
     confidence_threshold: float = Field(default=0.7, ge=0.0, le=1.0)
-    pipeline_max_rounds: int = Field(default=3, ge=1, le=5)
-    title_max_len: int = 120
+    max_pipeline_rounds: int = Field(default=3, ge=1, le=5)
 
     # Документы
     upload_dir: str = "storage/uploads"
@@ -65,7 +64,8 @@ class Settings(BaseSettings):
     chunk_overlap: int = 150
 
     # Защита
-    injection_max_suspicious_per_doc: int = 2
+    # больше стольких подозрительных фрагментов — задача уходит человеку
+    suspicious_chunk_limit: int = 2
 
     # Логи
     log_json: bool = False

@@ -39,7 +39,7 @@ class SentenceTransformerEmbedder:
     def __init__(
         self,
         model_name: str = settings.embedding_model,
-        dim: int = settings.embedding_dim,
+        dim: int = settings.embed_dim,
         query_prefix: str = settings.embedding_query_prefix,
         document_prefix: str = settings.embedding_document_prefix,
         batch_size: int = settings.embedding_batch_size,
@@ -107,3 +107,13 @@ def get_embedder() -> Embedder:
 def set_embedder(embedder: Embedder | None) -> None:
     global _embedder
     _embedder = embedder
+
+
+def embed_documents(texts: Sequence[str]) -> list[list[float]]:
+    """Векторы документов (с префиксом документа), пачкой."""
+    return get_embedder().embed_documents(texts)
+
+
+def embed_query(text: str) -> list[float]:
+    """Вектор запроса (с префиксом запроса)."""
+    return get_embedder().embed_query(text)

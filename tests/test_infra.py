@@ -11,6 +11,7 @@ from app.core.config import settings
 from app.core.migrate import MIGRATIONS_DIR, discover, migrate, pending
 from app.main import app
 from app.repositories import jobs as jobs_repo
+from app.schemas.cards import CardDraft
 from tests.fakes import delete_job
 
 
@@ -56,7 +57,7 @@ def test_migrate_from_scratch_then_noop(live_db, unique):
 def test_pool_is_shared_resource(live_db):
     assert db.pool() is db.pool()
     with db.connection() as conn:
-        assert conn.execute("SELECT 1 AS one").fetchone()["one"] == 1
+        assert conn.execute("SELECT 1").fetchone()[0] == 1
 
 
 # --- проверки состояния ------------------------------------------------------------------------
@@ -98,30 +99,35 @@ def test_readiness_on_live_db(live_db):
 
 
 @pytest.mark.db
-def test_jobs_idempotency_and_status(live_db, unique):
+def test_jobs_idempotency_and_status(conn, unique):
     key = f"key-{unique}"
-    job_id, created = jobs_repo.create_job("card", {"supplier_text": "x"}, key)
+    job_id = jobs_repo.create_job(conn, {"supplier_text": "первый"}, key)
     try:
-        again, created_again = jobs_repo.create_job("card", {"supplier_text": "x"}, key)
-        assert created and not created_again and again == job_id
-        jobs_repo.set_status(job_id, "generating", bump_attempts=True)
-        jobs_repo.set_status(job_id, "generating", bump_attempts=True)
-        jobs_repo.set_status(job_id, "needs_review", result={"title": "Т"}, review_reason="низко")
-        row = jobs_repo.get_job(job_id)
+        assert jobs_repo.create_job(conn, {"supplier_text": "второй"}, key) == job_id
+        assert jobs_repo.get_job_by_key(conn, key)["id"] == job_id
+        job = jobs_repo.get_job(conn, job_id)
+        assert (job["status"], job["attempts"], job["result"]) == ("pending", 0, None)
+        jobs_repo.set_status(conn, job_id, "extracting")
+        jobs_repo.set_status(conn, job_id, "generating", bump_attempts=True)
+        jobs_repo.set_status(conn, job_id, "generating", bump_attempts=True)
+        draft = CardDraft(title="Блендер 800 Вт", characteristics={"Мощность": "800 Вт"})
+        jobs_repo.set_status(conn, job_id, "needs_review", result=draft, review_reason="низко")
+        row = jobs_repo.get_job(conn, job_id)
         assert row["status"] == "needs_review"
         assert row["attempts"] == 2
-        assert row["result"] == {"title": "Т"}  # JSONB приходит словарём
+        assert row["result"]["title"] == "Блендер 800 Вт"  # JSONB приходит словарём
         assert row["review_reason"] == "низко"
     finally:
         delete_job(job_id)
 
 
 @pytest.mark.db
-def test_jobs_without_key_are_distinct(live_db):
-    a, _ = jobs_repo.create_job("card", {}, None)
-    b, _ = jobs_repo.create_job("card", {}, None)
+def test_jobs_without_key_are_distinct_and_unknown_is_none(conn):
+    a = jobs_repo.create_job(conn, {}, None)
+    b = jobs_repo.create_job(conn, {}, None)
     try:
         assert a != b
+        assert jobs_repo.get_job(conn, "no-such-job") is None
     finally:
         delete_job(a)
         delete_job(b)

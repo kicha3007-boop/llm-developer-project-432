@@ -1,11 +1,16 @@
-"""Разбор документов поставщиков: общие типы и выбор разборщика по расширению."""
+"""Разбор документов поставщиков: общий тип блока и выбор разборщика по формату.
+
+Разборщики принимают байты файла (или путь) и возвращают список ``Block``. Страница, секция,
+кегль и положение строки лежат в ``metadata`` блока.
+"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
-SUPPORTED_EXTENSIONS = (".pdf", ".docx", ".xlsx")
+SUPPORTED_KINDS = ("pdf", "docx", "xlsx")
 
 
 class ParseError(Exception):
@@ -16,51 +21,47 @@ class ParseError(Exception):
         self.reason = reason
 
 
-class NoTextLayerError(ParseError):
-    """В pdf нет текстового слоя — похоже на скан. Распознавание (OCR) не включено."""
-
-
 class UnsupportedFormatError(ParseError):
     pass
 
 
 @dataclass
 class Block:
-    """Структурная единица документа. Каждая знает свою страницу (если у формата они есть)."""
+    """Структурная единица документа: kind — line | heading | text | table."""
 
-    kind: str  # line | heading | text | table
-    text: str
-    page: int | None = None
-    section: str | None = None
+    kind: str = "text"
+    content: str = ""
     rows: list[list[str]] | None = None  # для таблиц: первая строка — заголовки колонок
-    size: float | None = None  # кегль строки pdf
-    top: float | None = None  # вертикальное положение строки pdf
-    level: int | None = None  # уровень заголовка
-    meta: dict = field(default_factory=dict)
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def page(self) -> int | None:
+        return self.metadata.get("page")
+
+    @property
+    def section(self) -> str | None:
+        return self.metadata.get("section")
 
 
-@dataclass
-class ParsedDocument:
-    blocks: list[Block]
-    pages: int | None = None
-    title: str | None = None
-    fmt: str = ""
+def read_source(source: bytes | str | Path) -> bytes:
+    if isinstance(source, bytes | bytearray):
+        return bytes(source)
+    return Path(source).read_bytes()
 
 
-def parse_file(path: str | Path) -> ParsedDocument:
-    """Разбирает файл по расширению. Нормализацию и резку делают отдельные модули."""
-    path = Path(path)
-    ext = path.suffix.lower()
-    if ext == ".pdf":
+def parse_any(data: bytes | str | Path, kind: str) -> list[Block]:
+    """Разбирает файл по формату (pdf | docx | xlsx, с точкой или без)."""
+    kind = kind.lower().lstrip(".")
+    if kind == "pdf":
         from app.parsers.pdf import parse_pdf
 
-        return parse_pdf(path)
-    if ext == ".docx":
+        return parse_pdf(data)
+    if kind == "docx":
         from app.parsers.docx import parse_docx
 
-        return parse_docx(path)
-    if ext == ".xlsx":
+        return parse_docx(data)
+    if kind == "xlsx":
         from app.parsers.xlsx import parse_xlsx
 
-        return parse_xlsx(path)
-    raise UnsupportedFormatError(f"формат {ext or 'без расширения'} не поддерживается")
+        return parse_xlsx(data)
+    raise UnsupportedFormatError(f"формат {kind or 'без расширения'} не поддерживается")

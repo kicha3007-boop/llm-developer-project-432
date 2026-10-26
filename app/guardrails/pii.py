@@ -1,6 +1,6 @@
 """Детекторы и маскирование персональных данных: телефон, почта, ИНН, номер карты.
 
-Найденное заменяется метками вида «[ТЕЛЕФОН_1]». Маскирование работает на фрагменте при сборке
+Найденное заменяется метками вида «[PHONE_1]». Маскирование работает на фрагменте при сборке
 контекста — до любого обращения к модели и до записи контекста в лог.
 
 ИНН проверяется по контрольной сумме: детектор «по длине» маскировал бы артикулы, суммы и даты,
@@ -14,10 +14,10 @@ from dataclasses import dataclass, field
 from typing import Any
 
 KIND_LABELS = {
-    "phone": "ТЕЛЕФОН",
+    "phone": "PHONE",
     "email": "EMAIL",
-    "inn": "ИНН",
-    "card": "КАРТА",
+    "inn": "INN",
+    "card": "CARD",
 }
 
 EMAIL_RE = re.compile(r"(?<![\w.+-])[\w.+-]+@[\w-]+(?:\.[\w-]+)+(?![\w-])", re.UNICODE)
@@ -37,7 +37,7 @@ def _checksum(digits: str, weights: tuple[int, ...]) -> int:
     return sum(int(d) * w for d, w in zip(digits, weights, strict=False)) % 11 % 10
 
 
-def is_valid_inn(value: str) -> bool:
+def _inn_checksum(value: str) -> bool:
     """Контрольная сумма ИНН: 10 цифр — юрлицо, 12 цифр — физлицо/ИП."""
     if not value.isdigit():
         return False
@@ -98,7 +98,7 @@ class PiiMasker:
         text = CARD_RE.sub(card, text)
 
         def inn(m: re.Match[str]) -> str:
-            return self._label("inn", m.group(0)) if is_valid_inn(m.group(0)) else m.group(0)
+            return self._label("inn", m.group(0)) if _inn_checksum(m.group(0)) else m.group(0)
 
         return INN_RE.sub(inn, text)
 
@@ -109,18 +109,19 @@ class PiiMasker:
         return counts
 
 
-@dataclass
-class PiiResult:
-    text: str
-    findings: list[PiiFinding]
+def mask_pii(text: str, masker: PiiMasker | None = None) -> tuple[str, list[PiiFinding]]:
+    """Маскирует персональные данные: (текст с метками, найденные сущности без исходных значений).
 
-
-def mask_pii(text: str, masker: PiiMasker | None = None) -> PiiResult:
-    """Маскирует персональные данные. Возвращает текст и найденное (без исходных значений)."""
+    Общий ``masker`` даёт сквозную нумерацию меток в пределах задачи.
+    """
     masker = masker or PiiMasker()
     before = len(masker.findings)
     masked = masker.mask(text)
-    return PiiResult(text=masked, findings=masker.findings[before:])
+    return masked, masker.findings[before:]
+
+
+def contains_pii(text: str) -> bool:
+    return bool(find_pii(text))
 
 
 def find_pii(text: str) -> list[str]:

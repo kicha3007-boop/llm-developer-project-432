@@ -48,7 +48,7 @@ LLM_RETRY = RetryPolicy(
     backoff_coefficient=2.0,
     maximum_interval=timedelta(minutes=1),
     maximum_attempts=3,
-    non_retryable_error_types=["StructuredOutputError", "ValidationError"],
+    non_retryable_error_types=["CardValidationError", "ValidationError"],
 )
 DB_RETRY = RetryPolicy(
     initial_interval=timedelta(seconds=1),
@@ -227,17 +227,20 @@ class GenerateCardWorkflow(_HumanReview):
                     retry_policy=PARSE_RETRY,
                 )
             await self._status_step(job_id, JobStatus.RETRIEVING)
-            context = await workflow.execute_activity(
+            prepared = await workflow.execute_activity(
                 prepare_context_activity,
                 args=[job_id, document_ids, product_hint],
                 start_to_close_timeout=LLM_TIMEOUT,
                 retry_policy=LLM_RETRY,
             )
+            context: str = prepared["context"]
+            scores: dict[str, float] = prepared["guard"].get("retrieval_scores", {})
             feedback: list[str] = []
             verdict = "rejected"
-            source_failures = 0
+            violations = 0
+            source_errors: list[str] = []
             card: dict[str, Any] | None = None
-            while context["items"] and self._attempts < max_rounds:
+            while prepared["chunk_ids"] and self._attempts < max_rounds:
                 self._attempts += 1
                 await self._status_step(
                     job_id,
@@ -253,18 +256,19 @@ class GenerateCardWorkflow(_HumanReview):
                 await self._status_step(job_id, JobStatus.VERIFYING)
                 check = await workflow.execute_activity(
                     verify_sources_activity,
-                    args=[job_id, card, context],
+                    args=[job_id, card, context, scores],
                     start_to_close_timeout=DB_TIMEOUT,
                     retry_policy=DB_RETRY,
                 )
                 card = check["card"]
                 if not check["ok"]:
-                    source_failures += 1
-                    feedback = check["errors"]
-                    if source_failures >= 2:  # выдуманная ссылка повторно — к человеку
+                    violations += 1
+                    source_errors = feedback = check["errors"]
+                    if violations >= 2:  # выдуманная ссылка повторно — к человеку
                         break
                     continue
-                source_failures = 0
+                violations = 0
+                source_errors = []
                 report = await workflow.execute_activity(
                     rag_critique_activity,
                     args=[job_id, card, context],
@@ -278,7 +282,15 @@ class GenerateCardWorkflow(_HumanReview):
                     break
             decision = await workflow.execute_activity(
                 finalize_rag_activity,
-                args=[job_id, card, verdict, feedback, source_failures, context, self._attempts],
+                args=[
+                    job_id,
+                    card,
+                    verdict,
+                    feedback,
+                    source_errors,
+                    prepared["guard"],
+                    self._attempts,
+                ],
                 start_to_close_timeout=DB_TIMEOUT,
                 retry_policy=DB_RETRY,
             )

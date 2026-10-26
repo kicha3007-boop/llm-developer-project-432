@@ -16,7 +16,7 @@ from typing import Any
 
 from app.agents import prompts
 from app.schemas.cards import JudgeVerdict
-from app.services.structured import generate_structured
+from app.services.structured import ask_model
 
 _TRAILING = re.compile(r"[.;:]+$")
 
@@ -156,12 +156,11 @@ def citation_score(
 
 async def judge_card(card: dict[str, Any], context_text: str) -> JudgeVerdict:
     """Третья метрика: модель-судья (дешёвая) получает карточку и фрагменты, выносит вердикт."""
-    return await generate_structured(
-        prompts.EVAL_JUDGE,
+    return await ask_model(
+        prompts.judge_agent,
         prompts.build_judge_prompt(card, context_text),
         JudgeVerdict,
-        purpose="eval_judge",
-        max_repairs=1,
+        max_retries=1,
     )
 
 

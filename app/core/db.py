@@ -12,19 +12,12 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 
 import psycopg
-from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 
 from app.core.config import settings
 
 _pool: ConnectionPool | None = None
 _lock = threading.Lock()
-
-
-def _configure(conn: psycopg.Connection) -> None:
-    # Каждое соединение пула отдаёт строки словарями и фиксирует изменения сразу:
-    # статус задачи должен быть виден опрашивающему клиенту немедленно.
-    conn.row_factory = dict_row  # type: ignore[assignment]
 
 
 def pool() -> ConnectionPool:
@@ -38,8 +31,8 @@ def pool() -> ConnectionPool:
                     min_size=settings.db_pool_min_size,
                     max_size=settings.db_pool_max_size,
                     timeout=settings.db_pool_timeout_s,
+                    # изменения фиксируются сразу: статус задачи виден клиенту немедленно
                     kwargs={"autocommit": True},
-                    configure=_configure,
                     open=True,
                     name="card-pool",
                 )
@@ -85,4 +78,4 @@ def readiness() -> dict:
         row = conn.execute(
             "SELECT extversion FROM pg_extension WHERE extname = 'vector'"
         ).fetchone()
-    return {"db": "ok", "vector": row["extversion"] if row else None}
+    return {"db": "ok", "vector": row[0] if row else None}

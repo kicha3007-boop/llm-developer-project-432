@@ -16,9 +16,9 @@ import statistics
 import sys
 from pathlib import Path
 
-from app.parsers import ParseError, parse_file
-from app.parsers.chunker import chunk_document
-from app.parsers.normalizer import normalize
+from app.parsers import ParseError, parse_any
+from app.parsers.chunker import chunk_blocks
+from app.parsers.normalizer import guess_title, normalize
 from app.rag.embedder import SentenceTransformerEmbedder, document_input
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -53,12 +53,14 @@ NEGATIVE = [
 def load_chunks() -> list[tuple[str, str, str | None, str | None]]:
     chunks = []
     for name in DOCS:
+        path = ROOT / "data" / name
         try:
-            doc = normalize(parse_file(ROOT / "data" / name))
+            blocks = normalize(parse_any(path, path.suffix))
         except ParseError:
             continue
-        for c in chunk_document(doc, name, name):
-            chunks.append((c.text, name, c.section, doc.title))
+        title = guess_title(blocks)
+        for c in chunk_blocks(blocks, name, name):
+            chunks.append((c["text"], name, c["metadata"].get("section"), title))
     return chunks
 
 

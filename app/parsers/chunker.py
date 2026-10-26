@@ -12,27 +12,15 @@ from __future__ import annotations
 
 import hashlib
 import re
-from dataclasses import dataclass, field
 from typing import Any
 
 from app.core.config import settings
-from app.parsers import Block, ParsedDocument
+from app.parsers import Block
 
 ARTICUL_RE = re.compile(r"\b[A-ZА-Я]{2,6}-[A-Z0-9]{2,8}\b")
 _UNIT_RE = re.compile(r"^(.+?),\s*([^\s,]{1,4})$")  # «Мощность, Вт» → («Мощность», «Вт»)
 _ARTICUL_HEADERS = {"артикул", "арт.", "sku", "код товара", "артикул товара"}
 _BRAND_HEADERS = {"бренд", "марка", "торговая марка", "производитель"}
-
-
-@dataclass
-class Chunk:
-    id: str
-    ord: int
-    kind: str  # text | table
-    text: str
-    page: int | None
-    section: str | None
-    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 def chunk_id(document_id: str, ord_: int, text: str) -> str:
@@ -148,17 +136,22 @@ def _table_chunks(block: Block) -> list[tuple[str, dict[str, Any]]]:
     return result
 
 
-def chunk_document(
-    doc: ParsedDocument,
-    document_id: str,
-    filename: str,
+def chunk_blocks(
+    blocks: list[Block],
+    doc_id: str,
+    filename: str | None = None,
     *,
     size: int | None = None,
     overlap: int | None = None,
-) -> list[Chunk]:
+) -> list[dict[str, Any]]:
+    """Режет нормализованные блоки на фрагменты: ``{"id", "ordinal", "kind", "text", "metadata"}``.
+
+    В ``metadata`` — ``doc_id``, ``filename``, ``page``, ``section``, ``kind`` и, где известны,
+    ``articul`` и ``brand``.
+    """
     size = size or settings.chunk_size
     overlap = settings.chunk_overlap if overlap is None else overlap
-    raw: list[tuple[str, str, int | None, str | None, dict[str, Any]]] = []
+    raw: list[tuple[str, str, dict[str, Any]]] = []
 
     # текстовые блоки собираем по (страница, секция), таблицы — отдельно, в порядке документа
     buffer: list[Block] = []
@@ -166,29 +159,32 @@ def chunk_document(
     def flush() -> None:
         if not buffer:
             return
-        text = "\n".join(b.text for b in buffer)
-        meta: dict[str, Any] = {}
-        if any(b.meta.get("tiny_font") for b in buffer):
+        text = "\n".join(b.content for b in buffer)
+        meta: dict[str, Any] = {"page": buffer[0].page, "section": buffer[0].section}
+        if any(b.metadata.get("tiny_font") for b in buffer):
             meta["tiny_font"] = True
         for piece in split_text(text, size, overlap):
-            raw.append(("text", piece, buffer[0].page, buffer[0].section, dict(meta)))
+            raw.append(("text", piece, dict(meta)))
         buffer.clear()
 
-    for block in doc.blocks:
+    def boundary(block: Block) -> tuple[Any, ...]:
+        return (block.page, block.section, bool(block.metadata.get("tiny_font")))
+
+    for block in blocks:
         if block.kind == "heading":
             flush()
             continue
         if block.kind == "table":
             flush()
+            base = {k: v for k, v in block.metadata.items() if k not in ("top", "font_size")}
             for text, meta in _table_chunks(block):
-                raw.append(("table", text, block.page, block.section, {**block.meta, **meta}))
+                raw.append(("table", text, {**base, **meta}))
+            continue
+        if not block.content.strip():
             continue
         # граница фрагмента: другая страница, секция или резкая смена кегля (мелкий шрифт
         # уходит отдельным фрагментом — так подозрительная вставка не тянет за собой соседей)
-        if buffer and (
-            (buffer[-1].page, buffer[-1].section, bool(buffer[-1].meta.get("tiny_font")))
-            != (block.page, block.section, bool(block.meta.get("tiny_font")))
-        ):
+        if buffer and boundary(buffer[-1]) != boundary(block):
             flush()
         buffer.append(block)
     flush()
@@ -198,13 +194,13 @@ def chunk_document(
     brands = {m["brand"] for *_x, m in raw if m.get("brand")}
     doc_brand = next(iter(brands)) if len(brands) == 1 else None
 
-    chunks: list[Chunk] = []
-    for ord_, (kind, text, page, section, meta) in enumerate(raw):
+    chunks: list[dict[str, Any]] = []
+    for ordinal, (kind, text, meta) in enumerate(raw):
         metadata: dict[str, Any] = {
-            "document_id": document_id,
+            "doc_id": doc_id,
             "filename": filename,
-            "page": page,
-            "section": section,
+            "page": meta.pop("page", None),
+            "section": meta.pop("section", None),
             "kind": kind,
             **meta,
         }
@@ -219,14 +215,12 @@ def chunk_document(
         if "brand" not in metadata and doc_brand:
             metadata["brand"] = doc_brand
         chunks.append(
-            Chunk(
-                id=chunk_id(document_id, ord_, text),
-                ord=ord_,
-                kind=kind,
-                text=text,
-                page=page,
-                section=section,
-                metadata=metadata,
-            )
+            {
+                "id": chunk_id(doc_id, ordinal, text),
+                "ordinal": ordinal,
+                "kind": kind,
+                "text": text,
+                "metadata": metadata,
+            }
         )
     return chunks

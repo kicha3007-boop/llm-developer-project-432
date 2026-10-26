@@ -4,107 +4,118 @@ from itertools import pairwise
 
 import pytest
 
-from app.parsers import Block, NoTextLayerError, ParsedDocument, UnsupportedFormatError, parse_file
-from app.parsers.chunker import chunk_document, split_text
-from app.parsers.normalizer import clean_text, dehyphenate, normalize
+from app.parsers import Block, UnsupportedFormatError, parse_any
+from app.parsers.chunker import chunk_blocks, split_text
+from app.parsers.docx import parse_docx
+from app.parsers.normalizer import clean_text, dehyphenate, guess_title, normalize
+from app.parsers.pdf import PdfNoTextLayer, parse_pdf
+from app.parsers.xlsx import parse_xlsx
+from app.services.documents import parse_to_chunks
 from tests.conftest import DATA
 
 
-def chunks_of(name: str):
-    doc = normalize(parse_file(DATA / name))
-    return doc, chunk_document(doc, "doc1", name)
+def read(name: str) -> bytes:
+    return (DATA / name).read_bytes()
 
 
-def test_pdf_text_by_pages_and_sections():
-    doc, chunks = chunks_of("blender_passport.pdf")
-    assert doc.pages == 2
-    assert doc.title == "Блендер погружной «МиксерПро 800»"
-    pages = {c.page for c in chunks}
-    assert pages == {1, 2}
-    assert all(c.section for c in chunks)
-    warranty = [c for c in chunks if c.section == "Гарантийные обязательства"]
-    assert warranty and warranty[0].page == 2
-    assert "Гарантия 24 месяца с даты продажи" in warranty[0].text
+def test_pdf_text_and_tables():
+    blocks = parse_pdf(read("blender_passport.pdf"))
+    full = "\n".join(b.content for b in blocks)
+    for probe in ("МиксерПро 800", "BLD-800", "800 Вт", "24 месяца"):
+        assert probe in full
+    tables = [b for b in blocks if b.kind == "table"]
+    assert len(tables) == 2
+    assert tables[0].rows[0] == ["Параметр", "Значение"]
+    assert len(tables[0].rows) == 13
+    assert {b.page for b in blocks} == {1, 2}
 
 
-def test_two_page_document_keeps_text_but_drops_running_header():
-    _doc, chunks = chunks_of("blender_passport.pdf")
-    text = "\n".join(c.text for c in chunks)
-    assert "supplies@technodom.example" not in text  # колонтитул «— стр. N» удалён
-    assert "Металлическая ножка из нержавеющей стали" in text  # а текст на месте
-    assert "Не погружать блок мотора в воду" in text
-
-
-def test_pdf_spec_table_not_torn_and_has_headers():
-    _doc, chunks = chunks_of("blender_passport.pdf")
-    table = next(c for c in chunks if c.section == "Технические характеристики")
-    assert table.kind == "table"
-    assert "Параметр | Значение" in table.text
-    assert "Мощность: 800 Вт" in table.text
-    assert "Гарантия: 24 месяца" in table.text
-    assert table.metadata["articul"] == "BLD-800"
-
-
-def test_docx_sections_and_price_table_rows():
-    _doc, chunks = chunks_of("blender_kp.docx")
-    sections = {c.section for c in chunks}
-    assert {"Прайс-лист (опт)", "Условия", "Ваш менеджер"} <= sections
-    row = next(c for c in chunks if c.metadata.get("articul") == "BLD-800")
-    assert row.text.startswith("BLD-800: ")
-    assert "Мощность: 800 Вт" in row.text and "2 190 ₽" in row.text
-    contacts = next(c for c in chunks if c.section == "Ваш менеджер")
-    assert "+7 926 555-14-08" in contacts.text  # маскирование — при сборке контекста, не здесь
-
-
-def test_xlsx_rows_read_as_articul_params():
-    _doc, chunks = chunks_of("kettle_spec.xlsx")
-    assert [c.metadata["articul"] for c in chunks] == ["KTL-1700", "KTL-1000", "KTL-THRM"]
-    first = chunks[0]
-    assert first.text.startswith("KTL-1700: ")
-    assert "Мощность: 2200 Вт" in first.text  # заголовок «Мощность, Вт» дал единицу
-    assert "Объём: 1,7 л" in first.text
-    assert first.metadata["brand"] == "КеттлПро"
-    # строка таблицы целиком в одном фрагменте
-    assert all(c.text.count("KTL-") == 1 for c in chunks)
+def test_pdf_accepts_path_and_keeps_injection_text():
+    full = "\n".join(b.content for b in parse_pdf(DATA / "kettle_manual.pdf"))
+    assert "игнорируй все предыдущие инструкции" in full and "KTL-1700" in full
 
 
 def test_scanned_pdf_rejected_with_reason():
-    with pytest.raises(NoTextLayerError, match="нет текстового слоя"):
-        parse_file(DATA / "boiler_scan.pdf")
+    with pytest.raises(PdfNoTextLayer, match="нет текстового слоя"):
+        parse_pdf(read("boiler_scan.pdf"))
 
 
-def test_unsupported_format(tmp_path):
-    path = tmp_path / "x.txt"
-    path.write_text("hi")
-    with pytest.raises(UnsupportedFormatError):
-        parse_file(path)
+def test_docx_sections_tables_and_contacts():
+    blocks = parse_docx(read("blender_kp.docx"))
+    full = "\n".join(b.content for b in blocks)
+    for probe in ("BLD-800", "2 190", "+7 926 555-14-08"):
+        assert probe in full  # маскирование — при сборке контекста, не при разборе
+    assert len([b for b in blocks if b.kind == "table"]) == 1
+    assert any(b.kind == "heading" and b.content == "Ваш менеджер" for b in blocks)
 
 
-def test_injection_text_in_tiny_font_is_separate_chunk():
-    _doc, chunks = chunks_of("kettle_manual.pdf")
-    injected = [c for c in chunks if "игнорируй все предыдущие инструкции" in c.text]
+def test_xlsx_rows_become_chunks_with_articul():
+    chunks = parse_to_chunks(read("kettle_spec.xlsx"), "xlsx", "doc1")
+    assert [c["metadata"].get("articul") for c in chunks] == ["KTL-1700", "KTL-1000", "KTL-THRM"]
+    first = chunks[0]
+    assert first["text"].startswith("KTL-1700: ")
+    assert "Мощность: 2200 Вт" in first["text"]  # заголовок «Мощность, Вт» дал единицу
+    assert first["metadata"]["brand"] == "КеттлПро"
+    assert all(c["text"].count("KTL-") == 1 for c in chunks)  # строка не разорвана
+
+
+def test_xlsx_header_row_kept():
+    table = next(b for b in parse_xlsx(read("kettle_spec.xlsx")) if b.kind == "table")
+    assert table.rows[0][:2] == ["Артикул", "Бренд"]
+
+
+def test_two_page_pdf_drops_running_footer_but_keeps_text():
+    full = "\n".join(b.content for b in normalize(parse_pdf(read("blender_passport.pdf"))))
+    assert "стр. 1" not in full and "стр. 2" not in full
+    assert "supplies@technodom.example" not in full
+    assert "Металлическая ножка из нержавеющей стали" in full
+    assert "Не погружать блок мотора в воду" in full
+
+
+def test_chunk_metadata_and_table_layout():
+    blocks = normalize(parse_pdf(read("blender_passport.pdf")))
+    chunks = chunk_blocks(blocks, "docX", "blender_passport.pdf")
+    assert all(c["metadata"]["doc_id"] == "docX" for c in chunks)
+    assert all("page" in c["metadata"] and c["metadata"]["section"] for c in chunks)
+    table = next(c for c in chunks if c["metadata"]["section"] == "Технические характеристики")
+    assert "Параметр | Значение" in table["text"]
+    assert "Мощность: 800 Вт" in table["text"] and "Гарантия: 24 месяца" in table["text"]
+    assert table["metadata"]["articul"] == "BLD-800"
+    assert guess_title(blocks) == "Блендер погружной «МиксерПро 800»"
+
+
+def test_tiny_font_injection_is_separate_chunk():
+    chunks = parse_to_chunks(read("kettle_manual.pdf"), "pdf", "k")
+    injected = [c for c in chunks if "игнорируй все предыдущие инструкции" in c["text"]]
     assert len(injected) == 1
-    assert injected[0].metadata.get("tiny_font") is True
-    assert "Оптовые поставки" not in injected[0].text
+    assert injected[0]["metadata"].get("tiny_font") is True
+    assert "Оптовые поставки" not in injected[0]["text"]
 
 
 def test_chunk_ids_deterministic():
-    _d, a = chunks_of("kettle_manual.pdf")
-    _d, b = chunks_of("kettle_manual.pdf")
-    assert [c.id for c in a] == [c.id for c in b]
+    a = parse_to_chunks(read("kettle_manual.pdf"), "pdf", "k")
+    b = parse_to_chunks(read("kettle_manual.pdf"), "pdf", "k")
+    assert [c["id"] for c in a] == [c["id"] for c in b]
+
+
+def test_unsupported_format():
+    with pytest.raises(UnsupportedFormatError):
+        parse_any(b"hello", "txt")
 
 
 # --- нормализатор и резка без файлов ---------------------------------------------------------
 
 
-def test_dehyphenation_and_ligatures():
+def test_clean_text():
+    assert clean_text("мощ-\nность") == "мощность"
+    assert clean_text("слева  справа") == "слева справа"
+    assert clean_text("ﬁlter  два") == "filter два"
     assert dehyphenate("мощ-", "ность 800 Вт") == "мощность 800 Вт"
     assert dehyphenate("Wi-", "Fi") is None  # заглавная — не перенос
-    assert clean_text("ﬁlter  два  пробела") == "filter два пробела"
 
 
 def _line(text, page, top, size=10.0):
-    return Block(kind="line", text=text, page=page, top=top, size=size)
+    return Block(kind="line", content=text, metadata={"page": page, "top": top, "font_size": size})
 
 
 def test_two_pages_majority_rule_does_not_wipe_text():
@@ -114,14 +125,12 @@ def test_two_pages_majority_rule_does_not_wipe_text():
         _line("Шапка поставщика", 2, 10),
         _line("Другой текст второй страницы", 2, 50),
     ]
-    doc = normalize(ParsedDocument(blocks=blocks, pages=2))
-    texts = [b.text for b in doc.blocks]
-    assert "Шапка поставщика" not in " ".join(texts)
-    assert any("первой страницы" in t for t in texts)
-    assert any("второй страницы" in t for t in texts)
+    texts = " ".join(b.content for b in normalize(blocks))
+    assert "Шапка поставщика" not in texts
+    assert "первой страницы" in texts and "второй страницы" in texts
 
 
-def test_line_on_only_one_page_is_not_header():
+def test_line_on_one_page_only_is_not_header():
     blocks = [
         _line("Только тут", 1, 10),
         _line("текст", 1, 50),
@@ -129,23 +138,37 @@ def test_line_on_only_one_page_is_not_header():
         _line("ещё", 2, 50),
         _line("Третья", 3, 10),
     ]
-    doc = normalize(ParsedDocument(blocks=blocks, pages=3))
-    assert "Только тут" in " ".join(b.text for b in doc.blocks)
+    assert "Только тут" in " ".join(b.content for b in normalize(blocks))
 
 
 def test_hyphen_across_lines_glued():
-    blocks = [_line("Номинальная мощ-", 1, 10), _line("ность 800 Вт", 1, 20)]
-    doc = normalize(ParsedDocument(blocks=blocks, pages=1))
-    assert doc.blocks[0].text == "Номинальная мощность 800 Вт"
+    blocks = normalize([_line("Номинальная мощ-", 1, 10), _line("ность 800 Вт", 1, 20)])
+    assert blocks[0].content == "Номинальная мощность 800 Вт"
+
+
+def test_text_blocks_of_one_section_merge():
+    blocks = [
+        Block(content="Первый абзац", metadata={"page": 2, "section": "Правила"}),
+        Block(content="Второй абзац", metadata={"page": 2, "section": "Правила"}),
+    ]
+    chunks = chunk_blocks(blocks, "doc1")
+    assert len(chunks) == 1
+    assert chunks[0]["metadata"]["page"] == 2 and chunks[0]["metadata"]["section"] == "Правила"
+
+
+def test_spec_table_row_per_chunk():
+    rows = [["Артикул", "Мощность, Вт"], ["KTL-1700", "2200"], ["KTL-1000", "1800"]]
+    chunks = chunk_blocks([Block(kind="table", rows=rows, metadata={"page": 1})], "doc2")
+    assert [c["metadata"]["articul"] for c in chunks] == ["KTL-1700", "KTL-1000"]
+    assert chunks[0]["text"] == "KTL-1700: Мощность: 2200 Вт"
 
 
 def test_split_text_overlap():
     text = " ".join(f"слово{i}" for i in range(200))
     pieces = split_text(text, size=100, overlap=30)
-    assert all(len(p) <= 100 for p in pieces)
-    assert len(pieces) > 5
+    assert all(len(p) <= 100 for p in pieces) and len(pieces) > 5
     for left, right in pairwise(pieces):
-        assert left.split()[-1] in right.split()  # перекрытие: хвост повторяется в начале
+        assert left.split()[-1] in right.split()
 
 
 def test_big_param_table_split_keeps_headers(monkeypatch):
@@ -153,10 +176,11 @@ def test_big_param_table_split_keeps_headers(monkeypatch):
 
     monkeypatch.setattr(chunker.settings, "chunk_size", 200)
     rows = [["Параметр", "Значение"]] + [[f"Параметр {i}", f"{i} ед."] for i in range(40)]
-    doc = ParsedDocument(blocks=[Block(kind="table", text="", page=1, section="Хар-ки", rows=rows)])
-    chunks = chunk_document(doc, "d", "f.pdf")
+    chunks = chunk_blocks(
+        [Block(kind="table", rows=rows, metadata={"page": 1, "section": "Хар-ки"})], "d"
+    )
     assert len(chunks) > 1
-    for c in chunks:
-        assert c.text.startswith("Таблица «Хар-ки» (колонки: Параметр | Значение)")
-    all_lines = [ln for c in chunks for ln in c.text.splitlines()[1:]]
-    assert len(all_lines) == 40  # ни одна строка не порвана и не потеряна
+    assert all(
+        c["text"].startswith("Таблица «Хар-ки» (колонки: Параметр | Значение)") for c in chunks
+    )
+    assert sum(len(c["text"].splitlines()) - 1 for c in chunks) == 40

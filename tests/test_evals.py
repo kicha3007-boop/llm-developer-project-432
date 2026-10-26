@@ -2,6 +2,7 @@
 
 import json
 
+from app.core.config import settings
 from evals.metrics import (
     characteristics_score,
     citation_score,
@@ -67,13 +68,14 @@ def test_citation_score_checks_chunk_content_and_probes():
 
 async def test_judge_prompt_on_fake_model(fake_llm):
     fake_llm.role(
-        "eval_judge",
+        "Judge",
         as_json({"supported": 3, "total": 4, "unsupported_claims": ["цвет графитовый"]}),
     )
     verdict = await judge_card({"title": "Блендер"}, "[a | f.pdf | стр. 1 | Х]\nМощность: 800 Вт")
     assert verdict.score == 0.75
     call = fake_llm.calls[0]
-    assert call["cheap"] and "Мощность: 800 Вт" in call["prompt"] and "Блендер" in call["prompt"]
+    assert call["model"] == settings.llm_cheap_model
+    assert "Мощность: 800 Вт" in call["prompt"] and "Блендер" in call["prompt"]
 
 
 def test_report_table_and_weakest():

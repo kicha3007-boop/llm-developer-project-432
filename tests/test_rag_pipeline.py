@@ -1,196 +1,258 @@
-"""Сквозной сценарий с подменённой моделью: поиск → контекст → карточка → проверка ссылок."""
+"""Сквозной сценарий с подменённой моделью: контекст → карточка → проверка ссылок → статус."""
 
+import json
 import re
 
 import pytest
 
+from app.guardrails import GuardReport
 from app.rag import embedder
-from app.repositories.chunks import Hit
-from app.schemas.jobs import JobStatus
+from app.rag.context import build_context, context_chunk_ids
+from app.schemas.cards import CardDraft, CritiqueReport
 from app.services import documents as documents_service
-from app.services import rag_pipeline
+from app.services import rag_pipeline as rp
 from tests.conftest import DATA, as_json
 from tests.fakes import HashEmbedder, delete_document
 
-HITS = [
-    Hit(
-        "c_014",
-        "d1",
-        "Мощность: 2200 Вт; Объём: 1,7 л",
-        0.9,
-        1,
-        "Технические характеристики",
-        {"filename": "kettle_manual.pdf"},
-    ),
-    Hit(
-        "c_020",
-        "d2",
-        "KTL-1700: Мощность: 2200 Вт; Цена опт: 1 890 ₽",
-        0.8,
-        None,
-        "Спецификация",
-        {"filename": "kettle_spec.xlsx"},
-    ),
-]
-APPROVE = as_json({"verdict": "approve", "issues": []})
+APPROVE = CritiqueReport(verdict="approve").model_dump_json()
+TEXTS = {"c1": "Блендер МиксерПро 800. Мощность: 800 Вт.", "c2": "Гарантия 24 месяца."}
 
 
-def card(sources, **extra):
-    base = {
-        "title": "Чайник КеттлПро 1.7, 2200 Вт",
-        "description": "Чайник на 1,7 л.",
-        "characteristics": {"Мощность": "2200 Вт", "Объём": "1,7 л"},
-        "benefits": ["быстрый нагрев"],
-        "sources": sources,
-        "missing_fields": ["Цвет"],
-        "confidence": 0.8,
+def card(chunk_id: str = "c1", **kw) -> str:
+    data = {
+        "title": "МиксерПро 800 — блендер 800 Вт",
+        "description": "Погружной блендер.",
+        "characteristics": {"Мощность": "800 Вт"},
+        "sources": [{"chunk_id": chunk_id, "page": 1}],
+        "missing_fields": [],
+        "confidence": 0.9,
     }
-    return as_json({**base, **extra})
+    return as_json({**data, **kw})
 
 
-GOOD = card([{"chunk_id": "c_014", "field": "Мощность"}, {"chunk_id": "c_014", "field": "Объём"}])
+# --- контекст ----------------------------------------------------------------------------------
+
+
+def chunk(cid: str, text: str, **meta) -> dict:
+    return {
+        "chunk_id": cid,
+        "text": text,
+        "metadata": {"page": 2, "section": "Характеристики", **meta},
+        "filename": "f.pdf",
+    }
+
+
+def test_context_headers_identify_sources():
+    ctx = build_context([chunk("c1", TEXTS["c1"]), chunk("c2", TEXTS["c2"])])
+    header = ctx.splitlines()[0]
+    assert header == "[c1 | f.pdf | стр. 2 | Характеристики]"
+    assert context_chunk_ids(ctx) == {"c1", "c2"}
+
+
+def test_context_dedupe_and_limit():
+    ctx = build_context([chunk("c1", "одно и то же"), chunk("c2", "одно  и то же")])
+    assert ctx.count("одно") == 1 and context_chunk_ids(ctx) == {"c1"}
+    big = build_context([chunk(f"c{i}", "x" * 4000) for i in range(5)], max_chars=6000)
+    assert len(big) <= 6000 and context_chunk_ids(big) == {"c0"}
+
+
+def test_masked_label_is_not_a_source():
+    ctx = build_context([chunk("c1", "Менеджер:\n[PHONE_1]")])
+    assert context_chunk_ids(ctx) == {"c1"}
+
+
+# --- проверка ссылок (без базы) ----------------------------------------------------------------
+
+CONTEXT = "[c1 | f.pdf | стр. 1]\n" + TEXTS["c1"]
+EXISTING = {
+    "c1": {"doc_id": "d1", "page": 1, "section": "Хар-ки"},
+    "c9": {"doc_id": "d9", "page": 3, "section": None},
+}
+
+
+def test_sources_verified_and_enriched():
+    draft, errors = rp.verify_sources(
+        CardDraft.model_validate_json(card()), CONTEXT, EXISTING, {"c1": 0.51}
+    )
+    assert errors == []
+    src = draft.sources[0]
+    assert (src.doc_id, src.page, src.section, src.score) == ("d1", 1, "Хар-ки", 0.51)
+
+
+def test_invented_source_rejected():
+    _d, errors = rp.verify_sources(
+        CardDraft.model_validate_json(card("deadbeef")), CONTEXT, EXISTING
+    )
+    assert "не существует в базе" in errors[0]
+
+
+def test_existing_but_unseen_source_rejected():
+    _d, errors = rp.verify_sources(CardDraft.model_validate_json(card("c9")), CONTEXT, EXISTING)
+    assert "не входил в поданный контекст" in errors[0]
+
+
+def test_characteristic_without_source_when_fields_given():
+    draft = CardDraft.model_validate_json(
+        card(
+            characteristics={"Мощность": "800 Вт", "Цвет": "графит"},
+            sources=[{"chunk_id": "c1", "field": "Мощность"}],
+        )
+    )
+    _d, errors = rp.verify_sources(draft, CONTEXT, EXISTING)
+    assert errors == ["у характеристики «Цвет» нет источника в sources"]
+
+
+def test_decide_status():
+    good = CardDraft.model_validate_json(card())
+    assert rp.decide_status(good, "approved", GuardReport()) == "done"
+    assert rp.decide_status(good, "rejected", GuardReport()) == "rejected"
+    low = CardDraft.model_validate_json(card(confidence=0.3))
+    assert rp.decide_status(low, "approved", GuardReport()) == "needs_review"
+    flagged = GuardReport(suspicious_chunks=["a", "b", "c"])
+    assert rp.decide_status(good, "approved", flagged) == "needs_review"
+
+
+async def test_critic_gets_source_contract(fake_llm):
+    fake_llm.role("Critic", CritiqueReport(verdict="approve"))
+    draft = CardDraft.model_validate_json(card())
+    report = await rp.critique_with_context(CONTEXT, draft)
+    assert report.verdict == "approve"
+    prompt = fake_llm.calls[0]["prompt"]
+    instructions, _, body = prompt.partition("КОНТЕКСТ:")
+    assert rp.CRITIC_CONTRACT in instructions
+    for name in ("doc_id", "page", "score", "chunk_id", "missing_fields"):
+        assert name in instructions
+    assert "Мощность: 800 Вт" in body
+
+
+# --- пайплайн с подменённым поиском и живой базой для проверки существования ------------------
 
 
 @pytest.fixture
-def in_db(monkeypatch):
-    """Какие фрагменты «существуют в базе» — задаёт тест."""
-    existing = {"c_014", "c_020", "c_999_other"}
-    monkeypatch.setattr(
-        rag_pipeline.chunks_repo, "existing_ids", lambda ids: {i for i in ids if i in existing}
+def corpus(conn, unique, monkeypatch):
+    doc_id = f"rag{unique}"
+    conn.execute(
+        "INSERT INTO documents (id, filename, content_hash, kind, status) "
+        "VALUES (%s, 'blender_test.pdf', %s, 'pdf', 'indexed')",
+        (doc_id, f"hash-{unique}"),
     )
-    return existing
+    for i, (cid, text) in enumerate(TEXTS.items()):
+        conn.execute(
+            "INSERT INTO chunks (id, doc_id, ordinal, text, metadata) VALUES (%s, %s, %s, %s, %s)",
+            (f"{cid}{unique}", doc_id, i, text, json.dumps({"doc_id": doc_id, "page": 1})),
+        )
+    cid = f"c1{unique}"
+    context = f"[{cid} | blender_test.pdf | стр. 1]\n{TEXTS['c1']}"
+
+    async def fake_retrieve(query, doc_ids=None):
+        return context, GuardReport(retrieval_scores={cid: 0.5123})
+
+    monkeypatch.setattr(rp, "retrieve_context_async", fake_retrieve)
+    yield doc_id, cid
+    delete_document(doc_id)
 
 
-async def test_approved_card_with_verified_sources(fake_llm, in_db):
-    fake_llm.role("rag_generator", GOOD)
-    fake_llm.role("rag_critic", APPROVE)
-    result = await rag_pipeline.run_rag_pipeline(["d1", "d2"], "чайник", hits=HITS)
-    assert result.status == JobStatus.APPROVED
-    assert result.attempts == 1
-    src = result.card.sources[0]
-    assert (src.page, src.section) == (1, "Технические характеристики")  # из контекста
-    prompt = fake_llm.calls[0]["prompt"]
-    assert "[c_014 | kettle_manual.pdf | стр. 1 | Технические характеристики]" in prompt
-    assert "Допустимые chunk_id: c_014, c_020" in prompt
-    payload = result.to_result()
-    assert payload["context_chunk_ids"] == ["c_014", "c_020"]
-    assert "security_report" in payload
+@pytest.mark.db
+async def test_happy_path(corpus, fake_llm):
+    doc_id, cid = corpus
+    fake_llm.role("Generator", card(cid)).role("Critic", APPROVE)
+    draft, attempts, verdict, status, guard = await rp.run_rag_pipeline("блендер", [doc_id])
+    assert (attempts, verdict, status) == (1, "approved", "done")
+    assert guard.retrieval_scores == {cid: 0.5123}
+    src = draft.sources[0]
+    assert (src.chunk_id, src.doc_id, src.page, src.score) == (cid, doc_id, 1, 0.5123)
+    assert f"Допустимые chunk_id: {cid}" in fake_llm.calls[0]["prompt"]
 
 
-async def test_invented_source_sends_card_to_rework(fake_llm, in_db):
-    invented = card(
-        [{"chunk_id": "c_404", "field": "Мощность"}, {"chunk_id": "c_014", "field": "Объём"}]
+@pytest.mark.db
+async def test_invented_source_regenerated_then_raises(corpus, fake_llm):
+    doc_id, cid = corpus
+    fake_llm.role("Generator", card("deadbeef0000"), card(cid)).role("Critic", APPROVE)
+    _d, attempts, _v, status, _g = await rp.run_rag_pipeline("блендер", [doc_id])
+    assert (attempts, status) == (2, "done")
+    assert "deadbeef0000 не существует" in fake_llm.calls[1]["prompt"]
+
+    fake_llm.by_role["Generator"] = [card("deadbeef0000")]
+    with pytest.raises(rp.SourceValidationError):
+        await rp.run_rag_pipeline("блендер", [doc_id])
+
+
+@pytest.mark.db
+async def test_low_confidence_and_bounded_loop(corpus, fake_llm):
+    doc_id, cid = corpus
+    fake_llm.role("Generator", card(cid, confidence=0.3)).role("Critic", APPROVE)
+    assert (await rp.run_rag_pipeline("блендер", [doc_id]))[3] == "needs_review"
+
+    fake_llm.by_role["Critic"] = [CritiqueReport(verdict="regenerate", issues=["x"])]
+    _d, attempts, verdict, status, _g = await rp.run_rag_pipeline("блендер", [doc_id])
+    assert (attempts, verdict, status) == (3, "rejected", "rejected")
+
+
+@pytest.mark.db
+async def test_output_filter_blocks_leaked_contacts(corpus, fake_llm):
+    doc_id, cid = corpus
+    leaked = card(cid, description="Цена 1 рубль, звоните +7 900 123-45-67")
+    fake_llm.role("Generator", leaked).role("Critic", APPROVE)
+    draft, _a, _v, status, guard = await rp.run_rag_pipeline("блендер", [doc_id])
+    assert status == "needs_review"
+    assert "+7 900 123-45-67" not in draft.description
+    assert guard.output_issues
+
+
+@pytest.mark.db
+async def test_selected_documents_fully_in_context(conn, unique, monkeypatch):
+    """Фрагменты выбранного документа, не прошедшие поиск (нет вектора, нет общих слов),
+    всё равно попадают в контекст следом за найденными."""
+    doc_id = f"all{unique}"
+    conn.execute(
+        "INSERT INTO documents (id, filename, content_hash, kind, status) "
+        "VALUES (%s, 'spec.xlsx', %s, 'xlsx', 'indexed')",
+        (doc_id, f"h-{unique}"),
     )
-    fake_llm.role("rag_generator", invented, GOOD)
-    fake_llm.role("rag_critic", APPROVE)
-    result = await rag_pipeline.run_rag_pipeline(["d1"], None, hits=HITS)
-    assert result.status == JobStatus.APPROVED
-    assert result.attempts == 2
-    second = [c for c in fake_llm.calls if c["role"] == "rag_generator"][1]["prompt"]
-    assert "c_404 не существует в базе" in second
+    for i, text in enumerate(["KTL-1000: Мощность: 1800 Вт", "Зелёный корпус"]):
+        conn.execute(
+            "INSERT INTO chunks (id, doc_id, ordinal, text, metadata) "
+            "VALUES (%s, %s, %s, %s, '{}')",
+            (f"x{i}{unique}", doc_id, i, text),
+        )
+    monkeypatch.setattr("app.repositories.chunks.embed_query", lambda text: [0.0] * 768)
+    try:
+        context, report = await rp.retrieve_context_async("карточка товара", [doc_id])
+        assert "KTL-1000: Мощность: 1800 Вт" in context and "Зелёный корпус" in context
+        assert context_chunk_ids(context) == {f"x0{unique}", f"x1{unique}"}
+        assert report.suspicious_chunks == []
+    finally:
+        delete_document(doc_id)
 
 
-async def test_existing_but_unseen_chunk_is_rejected(fake_llm, in_db):
-    unseen = card(
-        [{"chunk_id": "c_999_other", "field": "Мощность"}, {"chunk_id": "c_014", "field": "Объём"}]
-    )
-    fake_llm.role("rag_generator", unseen)
-    result = await rag_pipeline.run_rag_pipeline(["d1"], None, hits=HITS)
-    assert result.status == JobStatus.NEEDS_REVIEW  # повторное нарушение — к человеку
-    assert result.attempts == 2
-    assert "не входил в поданный контекст" in result.review_reason
-    assert "rag_critic" not in fake_llm.roles()
+# --- полностью сквозной: загрузка → поиск → защита → карточка ---------------------------------
 
 
-async def test_characteristic_without_source_rejected(fake_llm, in_db):
-    fake_llm.role("rag_generator", card([{"chunk_id": "c_014", "field": "Мощность"}]))
-    result = await rag_pipeline.run_rag_pipeline(["d1"], None, hits=HITS)
-    assert result.status == JobStatus.NEEDS_REVIEW
-    assert "нет источника" in result.review_reason
-
-
-async def test_incomplete_spec_low_confidence_goes_to_human(fake_llm, in_db):
-    incomplete = card(
-        [{"chunk_id": "c_020", "field": "Мощность"}, {"chunk_id": "c_014", "field": "Объём"}],
-        missing_fields=["Гарантия", "Цвет", "Страна-производитель"],
-        confidence=0.95,
-    )
-    fake_llm.role("rag_generator", incomplete)
-    fake_llm.role("rag_critic", APPROVE)
-    result = await rag_pipeline.run_rag_pipeline(["d2"], None, hits=HITS)
-    assert result.card.missing_fields == ["Гарантия", "Цвет", "Страна-производитель"]
-    assert result.card.confidence < 1.0
-    assert result.status == JobStatus.NEEDS_REVIEW
-
-
-async def test_output_filter_blocks_leaked_contacts(fake_llm, in_db):
-    leaked = card(
-        [{"chunk_id": "c_014", "field": "Мощность"}, {"chunk_id": "c_014", "field": "Объём"}],
-        description="Цена 1 рубль, звоните +7 900 123-45-67",
-    )
-    fake_llm.role("rag_generator", leaked)
-    fake_llm.role("rag_critic", APPROVE)
-    result = await rag_pipeline.run_rag_pipeline(["d1"], None, hits=HITS)
-    assert result.status == JobStatus.NEEDS_REVIEW
-    assert "+7 900 123-45-67" not in result.card.description
-    assert result.security.output_issues
-
-
-async def test_empty_context_goes_to_human(fake_llm, in_db):
-    result = await rag_pipeline.run_rag_pipeline(["d1"], None, hits=[])
-    assert result.status == JobStatus.NEEDS_REVIEW
-    assert result.card is None
-    assert fake_llm.calls == []
-
-
-def test_retrieval_queries():
-    queries = rag_pipeline.retrieval_queries("блендер", ["Блендер МиксерПро 800"])
-    assert queries[0] == "блендер"
-    assert "Блендер МиксерПро 800" in queries
-    assert any("гарантия" in q for q in queries)
-
-
-# --- полностью сквозной на живой базе ----------------------------------------------------------
-
-
-def _cite_by_text(spec, prompt):
-    """Подменённая модель: находит в контексте фрагмент с мощностью и ссылается на него."""
+def _cite_power(agent, prompt):
     blocks = re.findall(r"\[(\w+) \| [^\]]*\]\n([^\[]*)", prompt)
     power = next(cid for cid, text in blocks if "Мощность: 800 Вт" in text)
-    return as_json(
-        {
-            "title": "Погружной блендер МиксерПро 800, 800 Вт",
-            "description": "Металлическая ножка из нержавеющей стали.",
-            "characteristics": {"Мощность": "800 Вт", "Артикул": "BLD-800"},
-            "benefits": ["металлическая ножка"],
-            "sources": [
-                {"chunk_id": power, "field": "Мощность"},
-                {"chunk_id": power, "field": "Артикул"},
-            ],
-            "missing_fields": [],
-            "confidence": 0.95,
-        }
-    )
+    return card(power)
 
 
 @pytest.mark.db
 async def test_end_to_end_on_live_db(live_db, fake_llm, tmp_path, monkeypatch):
     monkeypatch.setattr(documents_service.settings, "upload_dir", str(tmp_path))
-    monkeypatch.setattr(rag_pipeline.retrieval.settings, "relevance_threshold", 0.0)
+    monkeypatch.setattr(rp.settings, "relevance_threshold", 0.0)
     embedder.set_embedder(HashEmbedder())
     name = "blender_passport.pdf"
-    upload = documents_service.register_upload(name, (DATA / name).read_bytes())
-    doc_id = upload.document["id"]
+    doc_id = documents_service.register_upload(name, (DATA / name).read_bytes()).document["id"]
     try:
-        assert documents_service.process_document(doc_id)["status"] == "indexed"
-        fake_llm.role("rag_generator", _cite_by_text)
-        fake_llm.role("rag_critic", APPROVE)
+        assert documents_service.ingest_document(doc_id) == "indexed"
+        fake_llm.role("Generator", _cite_power).role("Critic", APPROVE)
         statuses: list[str] = []
-        result = await rag_pipeline.run_rag_pipeline([doc_id], "блендер", on_status=statuses.append)
-        assert result.status == JobStatus.APPROVED, result.review_reason
+        draft, _a, _v, status, guard = await rp.run_rag_pipeline(
+            "блендер", [doc_id], on_status=statuses.append
+        )
+        assert status == "done"
         assert statuses[:3] == ["retrieving", "generating", "verifying"]
-        assert result.card.sources[0].page == 1
-        assert result.card.sources[0].section == "Технические характеристики"
+        src = draft.sources[0]
+        assert (src.doc_id, src.page, src.section) == (doc_id, 1, "Технические характеристики")
+        assert src.score is not None and guard.suspicious_chunks == []
     finally:
         embedder.set_embedder(None)
         delete_document(doc_id)

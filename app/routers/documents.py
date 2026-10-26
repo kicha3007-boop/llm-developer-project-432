@@ -47,20 +47,20 @@ def search(body: SearchRequest) -> list[SearchHit]:
         body.query,
         mode=body.mode,
         top_k=body.top_k,
-        document_ids=body.document_ids,
+        doc_ids=body.document_ids,
         articul=body.articul,
         brand=body.brand,
         threshold=body.threshold,
     )
     return [
         SearchHit(
-            chunk_id=h.chunk_id,
-            document_id=h.document_id,
-            text=h.text,
-            score=h.score,
-            page=h.page,
-            section=h.section,
-            metadata=h.metadata,
+            chunk_id=h["chunk_id"],
+            document_id=h["doc_id"],
+            text=h["text"],
+            score=h["score"],
+            page=h["page"],
+            section=h["section"],
+            metadata=h["metadata"],
         )
         for h in hits
     ]

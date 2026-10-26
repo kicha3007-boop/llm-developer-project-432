@@ -1,7 +1,9 @@
-"""Контракт результата: карточка товара и промежуточные результаты агентов.
+"""Контракт результата: черновик карточки и промежуточные результаты агентов.
 
-Приложение проверяет ответ модели этими моделями так же, как ответ своей базы:
-до того, как что-то с ним сделать.
+Имена и поля — как в эталоне курса (урок «Разбор примера»: ``SupplierFacts``, ``CardDraft``,
+``CritiqueReport``), расширенные шагом «Контракт результата»: seo-блок, ссылки на источники,
+недостающие поля и уверенность. Приложение проверяет ответ модели этими моделями так же,
+как ответ своей базы: до того, как что-то с ним сделать.
 """
 
 from __future__ import annotations
@@ -10,11 +12,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from app.core.config import settings
-
-TITLE_MAX_LEN = settings.title_max_len
-SEO_TITLE_MAX_LEN = 70
-SEO_DESCRIPTION_MAX_LEN = 160
+TITLE_MAX_LENGTH = 60
+_EMPTY_VALUES = {"-", "—", "нет данных", "n/a", "null", "none", "неизвестно"}
 
 
 def _norm_key(name: str) -> str:
@@ -30,65 +29,58 @@ def _drop_empty_values(value: Any) -> Any:
         if raw is None:
             continue
         text = str(raw).strip()
-        if not text or text.lower() in {
-            "-",
-            "—",
-            "нет данных",
-            "n/a",
-            "null",
-            "none",
-            "неизвестно",
-        }:
+        if not text or text.lower() in _EMPTY_VALUES:
             continue
         cleaned[str(key).strip()] = text
     return cleaned
 
 
 class SourceRef(BaseModel):
-    """Ссылка на фрагмент документа, из которого взято утверждение."""
+    """Ссылка на фрагмент. ``chunk_id`` (и ``field``) указывает модель; ``doc_id``, ``page``,
+    ``section`` и ``score`` заполняет система из базы и результатов поиска."""
 
     model_config = ConfigDict(extra="ignore")
 
     chunk_id: str = Field(min_length=1)
-    field: str | None = None
+    doc_id: str = ""
     page: int | None = None
+    score: float | None = None
+    field: str | None = None
     section: str | None = None
 
 
-class SeoBlock(BaseModel):
+class Seo(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
-    meta_title: str = Field(default="", max_length=SEO_TITLE_MAX_LEN)
-    meta_description: str = Field(default="", max_length=SEO_DESCRIPTION_MAX_LEN)
+    title: str = ""
+    description: str = ""
     keywords: list[str] = Field(default_factory=list)
 
 
-class ProductCard(BaseModel):
+class CardDraft(BaseModel):
     """Черновик карточки товара — итоговый контракт сервиса."""
 
     model_config = ConfigDict(extra="ignore")
 
-    title: str = Field(min_length=1, max_length=TITLE_MAX_LEN)
+    title: str = Field(min_length=1, max_length=TITLE_MAX_LENGTH)
     description: str = ""
     characteristics: dict[str, str] = Field(default_factory=dict)
     benefits: list[str] = Field(default_factory=list)
-    seo: SeoBlock = Field(default_factory=SeoBlock)
+    seo: Seo = Field(default_factory=Seo)
     sources: list[SourceRef] = Field(default_factory=list)
     missing_fields: list[str] = Field(default_factory=list)
-    confidence: float = Field(ge=0.0, le=1.0)
+    # Если модель уверенность не указала, её ограничивает код (штраф за недостающие поля)
+    confidence: float = Field(default=1.0, ge=0.0, le=1.0)
+
+    @field_validator("title", mode="before")
+    @classmethod
+    def _strip_title(cls, value: Any) -> Any:
+        return value.strip() if isinstance(value, str) else value
 
     @field_validator("characteristics", mode="before")
     @classmethod
     def _drop_empty(cls, value: Any) -> Any:
         return _drop_empty_values(value)
-
-    @field_validator("title")
-    @classmethod
-    def _strip_title(cls, value: str) -> str:
-        value = value.strip()
-        if not value:
-            raise ValueError("заголовок пустой")
-        return value
 
     @field_validator("missing_fields")
     @classmethod
@@ -103,7 +95,7 @@ class ProductCard(BaseModel):
         return result
 
     @model_validator(mode="after")
-    def _field_not_in_both_lists(self) -> ProductCard:
+    def _field_not_in_both_lists(self) -> CardDraft:
         present = {_norm_key(k) for k in self.characteristics}
         both = [m for m in self.missing_fields if _norm_key(m) in present]
         if both:
@@ -115,14 +107,13 @@ class ProductCard(BaseModel):
 
 
 class SupplierFacts(BaseModel):
-    """Результат извлекателя: структурированные факты из текста или контекста."""
+    """Результат извлекателя: структурированные факты из текста поставщика."""
 
     model_config = ConfigDict(extra="ignore")
 
     product_name: str = ""
     characteristics: dict[str, str] = Field(default_factory=dict)
     missing_fields: list[str] = Field(default_factory=list)
-    sources: list[SourceRef] = Field(default_factory=list)
 
     @field_validator("characteristics", mode="before")
     @classmethod
@@ -130,33 +121,33 @@ class SupplierFacts(BaseModel):
         return _drop_empty_values(value)
 
 
-class CritiqueIssue(BaseModel):
-    model_config = ConfigDict(extra="ignore")
-
-    field: str | None = None
-    rule: str = ""
-    message: str
-
-
 class CritiqueReport(BaseModel):
-    """Вердикт проверяющей роли. Literal превращается в enum в JSON-схеме."""
+    """Вердикт критика. Literal превращается в enum JSON-схемы."""
 
     model_config = ConfigDict(extra="ignore")
 
     verdict: Literal["approve", "regenerate"]
-    issues: list[CritiqueIssue] = Field(default_factory=list)
+    issues: list[str] = Field(default_factory=list)
 
     @field_validator("issues", mode="before")
     @classmethod
-    def _issues_from_strings(cls, value: Any) -> Any:
-        # Слабые модели возвращают замечания строками — принимаем и такую форму
+    def _issues_to_strings(cls, value: Any) -> Any:
+        # модели иногда возвращают замечания объектами {"field": ..., "message": ...}
         if isinstance(value, list):
-            return [{"message": item} if isinstance(item, str) else item for item in value]
+            out = []
+            for item in value:
+                if isinstance(item, dict):
+                    msg = str(item.get("message") or item.get("issue") or item)
+                    field = item.get("field")
+                    out.append(f"{field}: {msg}" if field else msg)
+                else:
+                    out.append(str(item))
+            return out
         return value
 
 
-class InjectionVerdict(BaseModel):
-    """Структурированный вердикт дешёвой модели-детектора инъекций."""
+class InjectionAnswer(BaseModel):
+    """Ответ дешёвой модели-детектора инъекций (разбирается в ``InjectionVerdict``)."""
 
     model_config = ConfigDict(extra="ignore")
 
@@ -181,16 +172,15 @@ class JudgeVerdict(BaseModel):
 # --- HTTP-контракты ---------------------------------------------------------------------------
 
 
-class CardRequest(BaseModel):
+class JobIn(BaseModel):
     supplier_text: str = Field(min_length=1)
 
 
 class CardResponse(BaseModel):
     status: str
     attempts: int
-    card: ProductCard | None = None
-    issues: list[str] = Field(default_factory=list)
-    review_reason: str | None = None
+    verdict: str
+    card: CardDraft | None = None
 
 
 class GenerateCardRequest(BaseModel):

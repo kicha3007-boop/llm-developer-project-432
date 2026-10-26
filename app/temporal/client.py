@@ -60,7 +60,7 @@ async def _start(workflow: str, args: list[Any], workflow_id: str) -> str:
 async def start_card_workflow(job_id: str, supplier_text: str) -> str:
     return await _start(
         "CardWorkflow",
-        [job_id, supplier_text, settings.pipeline_max_rounds],
+        [job_id, supplier_text, settings.max_pipeline_rounds],
         job_workflow_id(job_id),
     )
 
@@ -70,7 +70,7 @@ async def start_generate_workflow(
 ) -> str:
     return await _start(
         "GenerateCardWorkflow",
-        [job_id, document_ids, product_hint, settings.pipeline_max_rounds],
+        [job_id, document_ids, product_hint, settings.max_pipeline_rounds],
         job_workflow_id(job_id),
     )
 

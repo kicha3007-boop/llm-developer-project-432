@@ -1,78 +1,128 @@
 import pytest
 from pydantic import ValidationError
 
-from app.agents import prompts
-from app.schemas.cards import TITLE_MAX_LEN, ProductCard
-from app.services.structured import StructuredOutputError, generate_structured
+from app.schemas.cards import TITLE_MAX_LENGTH, CardDraft, Seo, SourceRef
+from app.services import structured
 from tests.conftest import as_json
 
-CARD = {
-    "title": "Погружной блендер МиксерПро 800, 800 Вт",
-    "description": "Металлическая ножка, турбо-режим.",
-    "characteristics": {"Мощность": "800 Вт"},
-    "benefits": ["металлическая ножка"],
-    "seo": {"meta_title": "Блендер МиксерПро 800", "meta_description": "Блендер 800 Вт"},
-    "sources": [],
-    "missing_fields": ["Цвет"],
-    "confidence": 0.8,
-}
+
+def card(**overrides) -> dict:
+    data = {
+        "title": "МиксерПро 800 — блендер",
+        "description": "Погружной блендер с металлической ножкой.",
+        "characteristics": {"Мощность": "800 Вт"},
+        "benefits": ["Металлическая ножка"],
+        "seo": {"title": "Блендер МиксерПро 800", "description": "Блендер", "keywords": ["б"]},
+        "sources": [{"chunk_id": "c1", "doc_id": "d1", "page": 3, "score": 0.9}],
+        "missing_fields": ["Гарантия"],
+        "confidence": 0.8,
+    }
+    data.update(overrides)
+    return data
 
 
-def test_card_validators():
-    with pytest.raises(ValidationError, match="title"):
-        ProductCard.model_validate({**CARD, "title": "x" * (TITLE_MAX_LEN + 1)})
-    with pytest.raises(ValidationError, match="confidence"):
-        ProductCard.model_validate({**CARD, "confidence": 1.5})
+# --- контракт схемы ----------------------------------------------------------------------------
+
+
+def test_title_limit_and_strip():
+    assert TITLE_MAX_LENGTH == 60
+    with pytest.raises(ValidationError, match="60"):
+        CardDraft.model_validate(card(title="А" * 61))
+    assert CardDraft.model_validate(card(title="  Блендер  ")).title == "Блендер"
+    with pytest.raises(ValidationError):
+        CardDraft.model_validate(card(title="   "))
+
+
+def test_confidence_bounds():
+    for bad in (1.5, -0.1):
+        with pytest.raises(ValidationError):
+            CardDraft.model_validate(card(confidence=bad))
+
+
+def test_empty_characteristics_dropped():
+    draft = CardDraft.model_validate(card(characteristics={"Мощность": "800 Вт", "Цвет": " "}))
+    assert draft.characteristics == {"Мощность": "800 Вт"}
+
+
+def test_field_not_in_both_lists():
     with pytest.raises(ValidationError, match="одновременно"):
-        ProductCard.model_validate({**CARD, "missing_fields": ["мощность"]})
-    card = ProductCard.model_validate(
-        {**CARD, "characteristics": {"Мощность": "800 Вт", "Цвет": ""}}
-    )
-    assert card.characteristics == {"Мощность": "800 Вт"}
+        CardDraft.model_validate(card(missing_fields=["мощность"]))
 
 
-async def test_schema_passed_and_duplicated_in_prompt(fake_llm):
-    fake_llm.add(as_json(CARD))
-    card = await generate_structured(prompts.GENERATOR, "факты", ProductCard)
-    assert card.title.startswith("Погружной")
-    call = fake_llm.calls[0]
-    assert call["schema"]["title"] == "ProductCard"
-    assert "JSON-схеме" in call["prompt"]
+def test_defaults():
+    assert Seo().title == "" and Seo().keywords == []
+    ref = SourceRef(chunk_id="c1")
+    assert ref.doc_id == "" and ref.page is None and ref.score is None
 
 
-async def test_invalid_json_is_repaired_with_error_in_prompt(fake_llm):
-    fake_llm.add("Вот карточка: {битый json", as_json(CARD))
-    card = await generate_structured(prompts.GENERATOR, "факты", ProductCard)
-    assert card.confidence == 0.8
-    assert len(fake_llm.calls) == 2
-    repair_prompt = fake_llm.calls[1]["prompt"]
-    assert "не прошёл проверку" in repair_prompt
-    assert "не является JSON" in repair_prompt
-    assert fake_llm.calls[1]["purpose"].endswith(":repair")
+# --- validate_or_retry -------------------------------------------------------------------------
 
 
-async def test_empty_answer_gives_error_after_limit(fake_llm):
-    fake_llm.add("", "", "")
-    with pytest.raises(StructuredOutputError, match="пустой ответ"):
-        await generate_structured(prompts.GENERATOR, "факты", ProductCard, max_repairs=2)
-    assert len(fake_llm.calls) == 3  # попыток ровно 1 + 2 лечения
+async def test_first_try(fake_llm):
+    fake_llm.add(as_json(card()))
+    draft = await structured.validate_or_retry("Факты")
+    assert draft.title.startswith("МиксерПро")
+    assert fake_llm.roles() == ["Generator"]
 
 
-async def test_long_title_is_repaired_pointwise(fake_llm):
-    broken = {**CARD, "title": "Очень длинный заголовок " * 20}
-    fake_llm.add(as_json(broken), as_json({"title": "Блендер МиксерПро 800"}))
-    card = await generate_structured(prompts.GENERATOR, "факты", ProductCard)
-    assert card.title == "Блендер МиксерПро 800"
-    assert card.description == CARD["description"]  # описание не переделывалось
+async def test_garbage_is_repaired_with_error_in_prompt(fake_llm):
+    fake_llm.add("Вот карточка: не JSON вообще", as_json(card()))
+    draft = await structured.validate_or_retry("Факты")
+    assert draft.confidence == 0.8
+    assert "нет JSON" in fake_llm.calls[1]["prompt"]
+    assert fake_llm.calls[1]["prompt"].startswith("Факты")  # исходная задача сохранена
+
+
+async def test_long_title_fixed_pointwise_with_error_text(fake_llm):
+    fake_llm.add(as_json(card(title="А" * 80)), as_json(card()))
+    draft = await structured.validate_or_retry("Факты")
+    assert draft.title == card()["title"]
+    assert draft.description == card()["description"]
     repair = fake_llm.calls[1]
-    assert repair["role"] == "field_repair"
-    assert repair["purpose"].endswith("repair_field:title")
-    assert "Текущий черновик" in repair["prompt"]
+    assert repair["role"] == "FieldFixer"
+    assert "60" in repair["prompt"] and "title" in repair["prompt"]
+
+
+async def test_gives_up_after_limit(fake_llm):
+    fake_llm.add(*[as_json(card(title="А" * 80))] * 3)
+    with pytest.raises(structured.CardValidationError):
+        await structured.validate_or_retry("Факты", max_retries=2)
+    assert len(fake_llm.calls) == 3  # 1 попытка + 2 исправления
+
+
+async def test_empty_answer_gives_error(fake_llm):
+    fake_llm.add("", "", "")
+    with pytest.raises(structured.CardValidationError, match="пустой ответ"):
+        await structured.validate_or_retry("Факты")
 
 
 async def test_model_level_error_goes_to_full_repair(fake_llm):
-    both = {**CARD, "missing_fields": ["Мощность"]}
-    fake_llm.add(as_json(both), as_json(CARD))
-    card = await generate_structured(prompts.GENERATOR, "факты", ProductCard)
-    assert card.missing_fields == ["Цвет"]
+    fake_llm.add(as_json(card(missing_fields=["Мощность"])), as_json(card()))
+    draft = await structured.validate_or_retry("Факты")
+    assert draft.missing_fields == ["Гарантия"]
+    assert fake_llm.roles() == ["Generator", "Generator"]
     assert "одновременно" in fake_llm.calls[1]["prompt"]
+
+
+async def test_sdk_object_output_accepted(fake_llm):
+    fake_llm.add(CardDraft.model_validate(card()))
+    assert (await structured.validate_or_retry("Факты")).confidence == 0.8
+
+
+# --- точечная переделка и порог ----------------------------------------------------------------
+
+
+async def test_regenerate_field_changes_only_that_field(fake_llm):
+    original = CardDraft.model_validate(card())
+    fake_llm.role("FieldFixer", as_json(card(title="Короткий заголовок", description="другое")))
+    result = await structured.regenerate_field(original, "title", "длиннее 60 символов")
+    assert result.title == "Короткий заголовок"
+    assert result.description == original.description
+    assert "title" in fake_llm.calls[0]["prompt"]
+
+
+def test_confidence_gate():
+    assert structured.confidence_gate(CardDraft.model_validate(card(confidence=0.3))) == (
+        "needs_review"
+    )
+    assert structured.confidence_gate(CardDraft.model_validate(card(confidence=0.87))) == "done"

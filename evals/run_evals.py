@@ -21,14 +21,14 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
-from app.core.db import close_pool, open_pool
+from app.core.db import close_pool, connection, open_pool
 from app.core.logging import bind_context, clear_context, get_logger, setup_logging
 from app.guardrails.pii import PiiMasker
-from app.rag.context import ContextItem, format_context
+from app.rag.context import build_context
 from app.repositories import chunks as chunks_repo
 from app.repositories import llm_calls
 from app.services import documents as documents_service
-from app.services.rag_pipeline import run_rag_pipeline
+from app.services.rag_pipeline import SourceValidationError, run_rag_pipeline
 from evals.metrics import characteristics_score, citation_score, judge_card, weakest_metric
 
 log = get_logger(__name__)
@@ -42,26 +42,32 @@ async def evaluate_document(name: str, golden: dict[str, Any], run_id: str) -> d
     path = ROOT / "data" / name
     upload = documents_service.register_upload(name, path.read_bytes())
     doc_id = upload.document["id"]
-    processed = documents_service.process_document(doc_id)
     row: dict[str, Any] = {"document": name, "document_id": doc_id}
-    if processed["status"] == "failed":
-        row.update(status="failed", reason=processed.get("error"))
+    if documents_service.ingest_document(doc_id) == "failed":
+        row.update(status="failed", reason=(documents_service.describe(doc_id) or {}).get("error"))
         return row
 
     job_id = f"eval-{run_id}-{doc_id}"
     clear_context()
     bind_context(job_id=job_id)
     started = time.perf_counter()
-    result = await run_rag_pipeline([doc_id], golden.get("product"))
+    try:
+        draft, attempts, verdict, status, guard = await run_rag_pipeline(
+            golden.get("product"), [doc_id]
+        )
+    except SourceValidationError as exc:
+        row.update(status="needs_review", reason=str(exc))
+        return row
     row["seconds"] = round(time.perf_counter() - started, 1)
-    row["status"] = result.status
-    row["attempts"] = result.attempts
-    row["review_reason"] = result.review_reason
-    card = result.card.model_dump() if result.card else {}
+    row.update(status=status, attempts=attempts, verdict=verdict)
+    row["security_report"] = guard.to_dict()
+    card = draft.model_dump()
     row["card"] = card
 
-    hits = chunks_repo.get_many(result.context_chunk_ids)
-    chunks = {h.chunk_id: {"text": h.text, "page": h.page} for h in hits}
+    ids = [s.chunk_id for s in draft.sources] + list(guard.retrieval_scores)
+    with connection() as conn:
+        rows = chunks_repo.get_chunks_by_ids(conn, ids)
+    chunks = {cid: {"text": r["text"], "page": r["page"]} for cid, r in rows.items()}
     expected = golden.get("characteristics") or {}
     chars = characteristics_score(expected, card) if expected else None
     cites = citation_score(card, chunks, golden.get("source_probes"))
@@ -72,24 +78,12 @@ async def evaluate_document(name: str, golden: dict[str, Any], run_id: str) -> d
     row["citation_problems"] = cites.problems
 
     masker = PiiMasker()
-    items = [
-        ContextItem(
-            h.chunk_id,
-            h.document_id,
-            h.metadata.get("filename"),
-            h.page,
-            h.section,
-            masker.mask(h.text),
-        )
-        for h in hits
-    ]
-    context_text, _ = format_context(items, 100_000)
-    if card:
-        verdict = await judge_card(card, context_text)
-        row["faithfulness"] = round(verdict.score, 3)
-        row["unsupported_claims"] = verdict.unsupported_claims
-    else:
-        row["faithfulness"] = None
+    context_text = build_context(
+        [{**r, "text": masker.mask(r["text"])} for r in rows.values()], 100_000
+    )
+    verdict_j = await judge_card(card, context_text)
+    row["faithfulness"] = round(verdict_j.score, 3)
+    row["unsupported_claims"] = verdict_j.unsupported_claims
 
     missing_expected = golden.get("missing_fields") or []
     row["missing_expected"] = missing_expected
@@ -98,7 +92,8 @@ async def evaluate_document(name: str, golden: dict[str, Any], run_id: str) -> d
     must_not = (golden.get("injection_must_be_blocked") or {}).get("card_must_not_contain", [])
     flat = json.dumps(card, ensure_ascii=False)
     row["injection_leaks"] = [s for s in must_not if s in flat]
-    cost = llm_calls.cost_for_job(job_id)
+    with connection() as conn:
+        cost = llm_calls.cost_for_job(conn, job_id)
     row["cost"] = str(cost.get("cost", Decimal(0)))
     row["calls"] = cost.get("calls", 0)
     return row

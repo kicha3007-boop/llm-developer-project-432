@@ -12,9 +12,11 @@ class JobStatus:
     """Цепочка состояний задачи генерации.
 
     pending → parsing → indexing → retrieving → generating → verifying
-            ↘ (переделка: regenerating → generating …, не больше pipeline_max_rounds кругов)
-    → approved      — автоматические проверки пройдены, ждёт подтверждения человека
+            ↘ (переделка: regenerating → generating …, не больше max_pipeline_rounds кругов)
+    → done          — критик одобрил, уверенность не ниже порога
     → needs_review  — ждёт человека: низкая уверенность, выдуманные ссылки, инъекции и т.п.
+    → rejected      — критик не одобрил за отведённые круги (черновик сохранён)
+    дальше процесс ждёт решения человека:
     → confirmed     — человек подтвердил карточку (сигнал approve)
     → rejected      — человек отклонил карточку (сигнал reject)
     → failed        — авария (исключение), отличается от делового отказа
@@ -28,14 +30,14 @@ class JobStatus:
     GENERATING = "generating"
     VERIFYING = "verifying"
     REGENERATING = "regenerating"
-    APPROVED = "approved"
+    DONE = "done"
     NEEDS_REVIEW = "needs_review"
     CONFIRMED = "confirmed"
     REJECTED = "rejected"
     FAILED = "failed"
 
-    # Состояния, в которых автоматическая часть закончена и процесс ждёт решения человека
-    AWAITING_HUMAN = frozenset({APPROVED, NEEDS_REVIEW})
+    # Автоматическая часть закончена, процесс ждёт решения человека
+    AWAITING_HUMAN = frozenset({DONE, NEEDS_REVIEW, REJECTED})
     TERMINAL = frozenset({CONFIRMED, REJECTED, FAILED})
 
 

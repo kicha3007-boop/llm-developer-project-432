@@ -6,6 +6,7 @@ from fastapi import APIRouter, Header, HTTPException
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
 
+from app.core.db import connection
 from app.repositories import documents as documents_repo
 from app.routers.jobs import start_job
 from app.schemas.cards import GenerateCardRequest
@@ -14,13 +15,18 @@ from app.temporal import client as temporal
 router = APIRouter(tags=["generate"])
 
 
+def _known(ids: list[str]) -> set[str]:
+    with connection() as conn:
+        return {d["id"] for d in documents_repo.get_documents(conn, ids)}
+
+
 @router.post("/generate-card", status_code=202)
 async def generate_card(
     body: GenerateCardRequest,
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
 ) -> JSONResponse:
     ids = list(dict.fromkeys(body.document_ids))
-    found = {d["id"] for d in await run_in_threadpool(documents_repo.get_many, ids)}
+    found = await run_in_threadpool(_known, ids)
     unknown = [i for i in ids if i not in found]
     if unknown:
         raise HTTPException(404, f"документы не найдены: {', '.join(unknown)}")

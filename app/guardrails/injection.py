@@ -12,12 +12,12 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 from app.agents import prompts
 from app.core.logging import get_logger
-from app.schemas.cards import InjectionVerdict
+from app.schemas.cards import InjectionAnswer
 
 log = get_logger(__name__)
 
@@ -71,56 +71,51 @@ RULES: list[tuple[str, re.Pattern[str]]] = [
 
 
 @dataclass
-class Detection:
+class InjectionVerdict:
+    """Вердикт детектора: подозрителен ли фрагмент, почему и каким уровнем решено."""
+
     suspicious: bool
-    reasons: list[str] = field(default_factory=list)
-    level: str = "rules"  # rules | model | fallback
+    reason: str = ""
+    level: str = "regex"  # regex | llm | fallback
 
 
-def rule_check(text: str, meta: dict[str, Any] | None = None) -> list[str]:
-    """Быстрый уровень: причины, по которым фрагмент подозрителен (пусто — чисто)."""
+def _rule_reasons(text: str, metadata: dict[str, Any] | None = None) -> list[str]:
     reasons = [name for name, pattern in RULES if pattern.search(text)]
-    if meta and meta.get("tiny_font") and reasons:
+    if metadata and metadata.get("tiny_font") and reasons:
         reasons.append("текст мелким шрифтом")
     return reasons
 
 
-async def model_check(text: str) -> InjectionVerdict:
-    """Точный уровень: дешёвая модель через тот же клиент (таймаут, повторы, учёт стоимости)."""
-    # импорт здесь, чтобы не тянуть structured при импорте модуля правил
-    from app.services.structured import generate_structured
+def detect_injection_regex(text: str, metadata: dict[str, Any] | None = None) -> InjectionVerdict:
+    """Быстрый уровень — бесплатные правила по тексту."""
+    reasons = _rule_reasons(text, metadata)
+    return InjectionVerdict(bool(reasons), reason="; ".join(reasons), level="regex")
 
-    return await generate_structured(
-        prompts.INJECTION_JUDGE,
+
+async def detect_injection_llm(text: str) -> InjectionVerdict:
+    """Точный уровень: узкий вопрос дешёвой модели через тот же клиент (таймаут, повторы,
+    учёт стоимости). Исключения пробрасываются — решение «закрыть дверь» принимает вызывающий."""
+    from app.services.structured import ask_model  # structured тянет клиента модели
+
+    answer = await ask_model(
+        prompts.injection_agent,
         prompts.build_injection_prompt(text),
-        InjectionVerdict,
-        purpose="injection_check",
-        max_repairs=1,
+        InjectionAnswer,
+        max_retries=1,
     )
+    return InjectionVerdict(answer.is_injection, reason=answer.reason, level="llm")
 
 
-async def detect(text: str, meta: dict[str, Any] | None = None) -> Detection:
-    reasons = rule_check(text, meta)
-    if not reasons:
-        return Detection(suspicious=False)
-    try:
-        verdict = await model_check(text)
-    except Exception as exc:  # недоступный детектор не открывает дверь
-        log.warning("injection_detector_unavailable", error=repr(exc))
-        return Detection(
-            suspicious=True,
-            reasons=[*reasons, f"точный детектор недоступен ({type(exc).__name__})"],
-            level="fallback",
-        )
-    if verdict.is_injection:
-        return Detection(
-            suspicious=True, reasons=[*reasons, f"модель: {verdict.reason}"], level="model"
-        )
-    return Detection(
-        suspicious=False, reasons=[f"модель сняла подозрение: {verdict.reason}"], level="model"
-    )
+# Следы выполненной инъекции в готовом тексте: подозрительная цена «1 рубль» и т.п.
+OUTPUT_RULES: list[tuple[str, re.Pattern[str]]] = [
+    *RULES,
+    (
+        "подозрительная цена из инструкции",
+        re.compile(r"(?<![\d.,])(?<!\d\s)\b1\s*(рубль|руб\.?|₽|rub)(?!\w)", re.IGNORECASE),
+    ),
+]
 
 
 def output_traces(text: str) -> list[str]:
     """Следы служебных инструкций в сгенерированном тексте (для фильтра выхода)."""
-    return [name for name, pattern in RULES if pattern.search(text)]
+    return [name for name, pattern in OUTPUT_RULES if pattern.search(text)]

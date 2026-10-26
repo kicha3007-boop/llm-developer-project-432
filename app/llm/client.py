@@ -1,12 +1,12 @@
 """Клиент модели — единственное место, которое знает про провайдера.
 
-Политика доступа к модели:
-- таймаут на HTTP-запрос и на весь прогон агента;
-- повтор с растущей задержкой и случайной примесью — только на ошибках, которые повтор лечит
-  (сеть, таймаут, 429, 5xx); ошибка в запросе (400, 401, 404) не повторяется;
-- выбор модели: служебные роли (``AgentSpec.cheap``) идут на дешёвую модель;
-- учёт: после каждого вызова в таблицу ``llm_calls`` пишутся задача, модель, токены, стоимость
-  и длительность. Учёт живёт здесь, а не в вызывающем коде, — его нельзя забыть в новом месте.
+Как в эталоне курса (урок «Разбор примера», ``setup_llm`` / ``_retryable`` / ``run_agent``):
+- ``setup_llm()`` один раз на процесс настраивает OpenAI Agents SDK: клиент с адресом, ключом и
+  таймаутом, интерфейс chat completions (его понимают локальные серверы), без трассировок;
+- ``run_agent(agent, prompt)`` — таймаут на весь прогон и повтор с растущей задержкой и
+  случайной примесью только на ошибках, которые повтор лечит (сеть, таймаут, 429, 5xx);
+- учёт: после каждого вызова в ``llm_calls`` пишутся задача, модель, токены, стоимость и
+  длительность (``_log_call`` / ``_log_failure``) — учёт нельзя забыть в новом месте.
 
 Здесь повторяется ВЫЗОВ модели. Повтор шага целиком — работа движка процессов (Temporal).
 """
@@ -16,12 +16,12 @@ from __future__ import annotations
 import asyncio
 import random
 import time
-from dataclasses import dataclass
+from contextvars import ContextVar
 from typing import Any
 
+from agents import Runner, set_default_openai_api, set_default_openai_client, set_tracing_disabled
 from openai import APIConnectionError, APIStatusError, APITimeoutError, AsyncOpenAI
 
-from app.agents.prompts import AgentSpec
 from app.core import db
 from app.core.config import settings
 from app.core.logging import current_context, get_logger
@@ -29,40 +29,26 @@ from app.llm.cost import cost_for_call
 
 log = get_logger(__name__)
 
-_openai_client: AsyncOpenAI | None = None
+_client_configured = False
+# номер текущей попытки — для записи успешного вызова в llm_calls
+_attempt: ContextVar[int] = ContextVar("llm_attempt", default=1)
 
 
-@dataclass(frozen=True)
-class LLMResponse:
-    text: str
-    input_tokens: int
-    output_tokens: int
-    model: str
-
-
-def _client() -> AsyncOpenAI:
-    """Клиент SDK создаётся один раз на процесс. Собственные повторы SDK выключены:
-    уровень повторов вызова один — цикл в ``run_agent``."""
-    global _openai_client
-    if _openai_client is None:
-        from agents import set_tracing_disabled
-
-        _openai_client = AsyncOpenAI(
-            base_url=settings.llm_base_url,
-            api_key=settings.llm_api_key or "not-needed",
-            timeout=settings.llm_timeout_s,
-            max_retries=0,
-        )
-        # Трассировки SDK уходят на адрес OpenAI мимо base_url — отключаем
-        set_tracing_disabled(True)
-    return _openai_client
-
-
-def model_for(spec: AgentSpec) -> tuple[str, str]:
-    """Уровень и имя модели для роли: служебные вызовы — на дешёвую модель."""
-    if spec.cheap:
-        return "cheap", settings.llm_cheap_model
-    return "main", settings.llm_model
+def setup_llm() -> None:
+    """Настройка SDK; безопасна к повторному вызову (API, воркер, команды)."""
+    global _client_configured
+    if _client_configured:
+        return
+    client = AsyncOpenAI(
+        base_url=settings.llm_base_url,
+        api_key=settings.llm_api_key or "not-needed",
+        timeout=settings.llm_timeout_s,
+        max_retries=0,  # уровень повторов вызова один — цикл в run_agent
+    )
+    set_default_openai_client(client)
+    set_default_openai_api("chat_completions")
+    set_tracing_disabled(True)
+    _client_configured = True
 
 
 def _retryable(exc: BaseException) -> bool:
@@ -70,112 +56,109 @@ def _retryable(exc: BaseException) -> bool:
     if isinstance(exc, (APIConnectionError, APITimeoutError, TimeoutError)):
         return True
     if isinstance(exc, APIStatusError):
-        return exc.status_code == 429 or exc.status_code >= 500
+        status = getattr(exc, "status_code", 0) or 0
+        return status == 429 or status >= 500
     return False
 
 
 def _backoff(attempt: int) -> float:
-    """Экспонента с потолком и случайной примесью, чтобы воркеры не просыпались синхронно."""
     return min(2**attempt * 0.5, 8.0) * (1 + random.random() * 0.25)
 
 
-async def _call_model(
-    spec: AgentSpec, model: str, prompt: str, schema: dict[str, Any] | None
-) -> LLMResponse:
-    """Один прогон агента OpenAI Agents SDK через chat completions совместимого сервера."""
-    from agents import Agent, ModelSettings, OpenAIChatCompletionsModel, Runner
-
-    extra_body: dict[str, Any] | None = None
-    if schema is not None and settings.llm_structured_output == "json_schema":
-        extra_body = {
-            "response_format": {
-                "type": "json_schema",
-                "json_schema": {"name": spec.name, "schema": schema, "strict": False},
-            }
-        }
-    agent = Agent(
-        name=spec.name,
-        instructions=spec.instructions,
-        model=OpenAIChatCompletionsModel(model=model, openai_client=_client()),
-        model_settings=ModelSettings(
-            temperature=spec.temperature
-            if spec.temperature is not None
-            else settings.llm_temperature,
-            max_tokens=settings.llm_max_tokens,
-            extra_body=extra_body,
-        ),
-    )
-    result = await Runner.run(agent, prompt, max_turns=1)
-    usage = result.context_wrapper.usage
-    output = result.final_output
-    return LLMResponse(
-        text=output if isinstance(output, str) else str(output or ""),
-        input_tokens=int(usage.input_tokens or 0),
-        output_tokens=int(usage.output_tokens or 0),
-        model=model,
-    )
+def model_tier(agent: Any) -> tuple[str, str]:
+    """Уровень и имя модели агента: служебные агенты созданы на дешёвой модели."""
+    model = getattr(agent, "model", None)
+    name = model if isinstance(model, str) else getattr(model, "model", None) or settings.llm_model
+    tier = "cheap" if name == settings.llm_cheap_model and name != settings.llm_model else "main"
+    return tier, name
 
 
-async def _record_call(**fields: Any) -> None:
-    """Пишет вызов в таблицу llm_calls. Сбой учёта не роняет генерацию, но виден в логе.
+def _usage(result: Any) -> tuple[int, int]:
+    usage = getattr(getattr(result, "context_wrapper", None), "usage", None)
+    if usage is None:
+        return 0, 0
+    return int(getattr(usage, "input_tokens", 0) or 0), int(getattr(usage, "output_tokens", 0) or 0)
 
-    Запись идёт, только если процесс уже поднял пул соединений (приложение или воркер);
-    модульные тесты без базы сюда не ходят.
-    """
+
+def _record(fields: dict[str, Any]) -> None:
+    """Пишет вызов в llm_calls, если процесс поднял пул (API или воркер). Сбой учёта не
+    роняет генерацию, но виден в логе."""
     if not db.pool_initialized():
         return
     from app.repositories import llm_calls
 
     try:
-        await asyncio.to_thread(llm_calls.insert_call, **fields)
+        with db.connection() as conn:
+            llm_calls.insert_call(conn, **fields)
     except Exception as exc:  # учёт не должен ломать основной путь
         log.warning("llm_call_record_failed", error=repr(exc))
 
 
-async def run_agent(
-    spec: AgentSpec,
-    prompt: str,
-    *,
-    schema: dict[str, Any] | None = None,
-    purpose: str | None = None,
-) -> str:
-    """Вызывает модель для роли и возвращает текст ответа.
-
-    ``schema`` — JSON-схема ожидаемого ответа; при поддержке сервером передаётся в
-    ``response_format``. Разбор и проверку ответа делает ``app/services/structured.py``.
-    """
-    tier, model = model_for(spec)
+def _base_fields(agent: Any, started: float, attempt: int) -> dict[str, Any]:
     ctx = current_context()
-    job_id, request_id = ctx.get("job_id"), ctx.get("request_id")
-    purpose = purpose or spec.name
-    max_attempts = settings.llm_max_retries
-    for attempt in range(1, max_attempts + 1):
+    tier, model = model_tier(agent)
+    return {
+        "job_id": ctx.get("job_id"),
+        "request_id": ctx.get("request_id"),
+        "purpose": getattr(agent, "name", "agent"),
+        "tier": tier,
+        "model": model,
+        "duration_ms": int((time.perf_counter() - started) * 1000),
+        "attempt": attempt,
+    }
+
+
+def _log_call(agent: Any, result: Any, started: float) -> None:
+    attempt = _attempt.get()
+    fields = _base_fields(agent, started, attempt)
+    input_tokens, output_tokens = _usage(result)
+    cost = cost_for_call(fields["tier"], input_tokens, output_tokens)
+    fields.update(
+        input_tokens=input_tokens, output_tokens=output_tokens, cost=cost, status="ok", error=None
+    )
+    log.info(
+        "llm_call",
+        agent=fields["purpose"],
+        tier=fields["tier"],
+        model=fields["model"],
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        cost=str(cost),
+        duration_ms=fields["duration_ms"],
+        attempt=attempt,
+    )
+    _record(fields)
+
+
+def _log_failure(agent: Any, exc: BaseException, started: float, attempt: int) -> None:
+    fields = _base_fields(agent, started, attempt)
+    fields.update(
+        input_tokens=0,
+        output_tokens=0,
+        cost=cost_for_call(fields["tier"], 0, 0),
+        status="error",
+        error=repr(exc)[:500],
+    )
+    _record(fields)
+
+
+async def run_agent(agent: Any, prompt: str) -> Any:
+    """Прогон агента с таймаутом и повторами. Возвращает ``final_output`` (обычно строку)."""
+    setup_llm()
+    max_retries = settings.llm_max_retries
+    for attempt in range(1, max_retries + 1):
         started = time.perf_counter()
+        _attempt.set(attempt)
         try:
-            response = await asyncio.wait_for(
-                _call_model(spec, model, prompt, schema), timeout=settings.llm_timeout_s
+            result = await asyncio.wait_for(
+                Runner.run(agent, prompt), timeout=settings.llm_timeout_s
             )
         except Exception as exc:
-            duration_ms = int((time.perf_counter() - started) * 1000)
-            await _record_call(
-                job_id=job_id,
-                request_id=request_id,
-                purpose=purpose,
-                tier=tier,
-                model=model,
-                input_tokens=0,
-                output_tokens=0,
-                cost=cost_for_call(tier, 0, 0),
-                duration_ms=duration_ms,
-                attempt=attempt,
-                status="error",
-                error=repr(exc)[:500],
-            )
-            if attempt == max_attempts or not _retryable(exc):
+            _log_failure(agent, exc, started, attempt)
+            if attempt == max_retries or not _retryable(exc):
                 log.error(
                     "llm_call_failed",
-                    agent=spec.name,
-                    model=model,
+                    agent=getattr(agent, "name", "agent"),
                     attempt=attempt,
                     error=repr(exc),
                 )
@@ -183,42 +166,13 @@ async def run_agent(
             delay = _backoff(attempt)
             log.warning(
                 "llm_call_retry",
-                agent=spec.name,
-                model=model,
+                agent=getattr(agent, "name", "agent"),
                 attempt=attempt,
                 delay_s=round(delay, 2),
                 error=repr(exc),
             )
             await asyncio.sleep(delay)
             continue
-
-        duration_ms = int((time.perf_counter() - started) * 1000)
-        cost = cost_for_call(tier, response.input_tokens, response.output_tokens)
-        await _record_call(
-            job_id=job_id,
-            request_id=request_id,
-            purpose=purpose,
-            tier=tier,
-            model=model,
-            input_tokens=response.input_tokens,
-            output_tokens=response.output_tokens,
-            cost=cost,
-            duration_ms=duration_ms,
-            attempt=attempt,
-            status="ok",
-            error=None,
-        )
-        log.info(
-            "llm_call",
-            agent=spec.name,
-            purpose=purpose,
-            tier=tier,
-            model=model,
-            input_tokens=response.input_tokens,
-            output_tokens=response.output_tokens,
-            cost=str(cost),
-            duration_ms=duration_ms,
-            attempt=attempt,
-        )
-        return response.text
+        _log_call(agent, result, started)
+        return result.final_output
     raise RuntimeError("unreachable")  # pragma: no cover

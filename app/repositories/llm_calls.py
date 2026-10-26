@@ -1,14 +1,16 @@
-"""Репозиторий журнала вызовов модели."""
+"""Репозиторий журнала вызовов модели. Соединение передаёт вызывающий."""
 
 from __future__ import annotations
 
 from decimal import Decimal
 from typing import Any
 
-from app.core.db import connection
+import psycopg
+from psycopg.rows import dict_row
 
 
 def insert_call(
+    conn: psycopg.Connection,
     *,
     job_id: str | None,
     request_id: str | None,
@@ -23,8 +25,8 @@ def insert_call(
     status: str,
     error: str | None,
 ) -> None:
-    with connection() as conn:
-        conn.execute(
+    with conn.cursor() as cur:
+        cur.execute(
             """
             INSERT INTO llm_calls (job_id, request_id, purpose, tier, model, input_tokens,
                                    output_tokens, cost, duration_ms, attempt, status, error)
@@ -47,10 +49,10 @@ def insert_call(
         )
 
 
-def cost_for_job(job_id: str) -> dict[str, Any]:
+def cost_for_job(conn: psycopg.Connection, job_id: str) -> dict[str, Any]:
     """Стоимость одной карточки — одним запросом по идентификатору задачи."""
-    with connection() as conn:
-        row = conn.execute(
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
             """
             SELECT count(*) AS calls,
                    coalesce(sum(cost), 0) AS cost,
@@ -61,15 +63,16 @@ def cost_for_job(job_id: str) -> dict[str, Any]:
             FROM llm_calls WHERE job_id = %s
             """,
             (job_id,),
-        ).fetchone()
+        )
+        row = cur.fetchone()
     return dict(row) if row else {}
 
 
-def breakdown_by_model(job_id: str | None = None) -> list[dict[str, Any]]:
+def breakdown_by_model(conn: psycopg.Connection, job_id: str | None = None) -> list[dict[str, Any]]:
     """Разбивка по моделям: сколько вызовов и на какую сумму ушло на дешёвую и основную."""
     where, args = ("WHERE job_id = %s", (job_id,)) if job_id else ("", ())
-    with connection() as conn:
-        return conn.execute(
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
             f"""
             SELECT tier, model, count(*) AS calls, sum(cost) AS cost,
                    sum(input_tokens) AS input_tokens, sum(output_tokens) AS output_tokens,
@@ -78,16 +81,5 @@ def breakdown_by_model(job_id: str | None = None) -> list[dict[str, Any]]:
             GROUP BY tier, model ORDER BY tier, model
             """,
             args,
-        ).fetchall()
-
-
-def calls_for_job(job_id: str) -> list[dict[str, Any]]:
-    with connection() as conn:
-        return conn.execute(
-            """
-            SELECT purpose, tier, model, input_tokens, output_tokens, cost, duration_ms,
-                   attempt, status, created_at
-            FROM llm_calls WHERE job_id = %s ORDER BY id
-            """,
-            (job_id,),
-        ).fetchall()
+        )
+        return cur.fetchall()
