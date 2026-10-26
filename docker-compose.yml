@@ -1,0 +1,46 @@
+services:
+  db:
+    # Образ с уже собранным pgvector: CREATE EXTENSION vector только активирует расширение
+    image: pgvector/pgvector:0.8.1-pg16
+    environment:
+      POSTGRES_DB: card
+      POSTGRES_USER: card
+      POSTGRES_PASSWORD: card
+    ports:
+      - "${PG_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U card -d card"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  temporal:
+    # Сервер разработки Temporal одним контейнером: gRPC на 7233, веб-интерфейс на 8233.
+    # История процессов хранится в SQLite-файле на томе и переживает перезапуск контейнера.
+    image: temporalio/temporal:1.8.3
+    command:
+      - server
+      - start-dev
+      - --ip
+      - 0.0.0.0
+      - --ui-ip
+      - 0.0.0.0
+      - --db-filename
+      - /data/temporal.db
+    user: root
+    ports:
+      - "${TEMPORAL_PORT:-7233}:7233"
+      - "${TEMPORAL_UI_PORT:-8233}:8233"
+    volumes:
+      - temporal-data:/data
+    healthcheck:
+      test: ["CMD", "temporal", "operator", "cluster", "health", "--address", "localhost:7233"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+volumes:
+  pgdata:
+  temporal-data:
